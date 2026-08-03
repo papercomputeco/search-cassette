@@ -1,0 +1,97 @@
+# A tapes deployment with the search cassette in it: Postgres (with
+# pgvector), Ollama for embeddings, the tapes API, and the cassette beside
+# it.
+#
+# A cassette is only observable through core. Started alone, the search
+# cassette is an HTTP server with an OpenAPI document and nothing to fetch
+# it; started here, tapes admits it, republishes its path under
+# /v1/cassettes/search, and answers for it in discovery:
+#
+#   docker compose up --build -d
+#   curl localhost:8081/v1/cassettes
+#   curl "localhost:8081/v1/cassettes/search/spans?query=retry+backoff"
+#
+# Spans to search come from a tapes deployment writing to the same database:
+# run the tapes proxy and derive worker against it (or `tapesctl seed`) and
+# the cassette's embed pass picks the projection up on its next interval.
+# Until then search truthfully answers 503 (not initialized) and then empty
+# results — both are working states.
+name: tapes-search-cassette
+
+services:
+  postgres:
+    image: public.ecr.aws/g4e5l3z3/papercomputeco/postgres:17.7-pgduckdb-1.1.1
+    environment:
+      POSTGRES_DB: tapes
+      POSTGRES_USER: tapes
+      POSTGRES_PASSWORD: tapes
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Creates the vector extension, the cassette's role, and its read
+      # grants. Postgres runs this once, when the data directory is first
+      # initialized — `docker compose down -v` to re-run it.
+      - ./provision.sql:/docker-entrypoint-initdb.d/10-cassette-role.sql:ro
+    healthcheck:
+      # -h forces TCP: during initdb a socket-only temporary server answers
+      # a bare pg_isready seconds before network connections work, and both
+      # dependents run migrations at startup against a refused connection.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U tapes -d tapes"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  ollama:
+    image: ollama/ollama
+    volumes:
+      - ollama-data:/root/.ollama
+    # The embed pass needs the model present; pulling it is a deployment
+    # step, not a cassette one:
+    #   docker compose exec ollama ollama pull embeddinggemma
+
+  search:
+    build: .
+    ports:
+      - "127.0.0.1:9998:9998"
+    environment:
+      CASSETTE_NAME: search
+      CASSETTE_LISTEN: 0.0.0.0:9998
+      CASSETTE_EMBEDDING_PROVIDER: ollama
+      CASSETTE_EMBEDDING_TARGET: http://ollama:11434
+      # Postgres and the projection tables appear after tapes' first
+      # migration run; retry instead of crashlooping through the race.
+      CASSETTE_WAIT_FOR_DB: "true"
+      # The credential the deployment provisioned in provision.sql, under
+      # the role name the manifest derives. Tapes neither creates this role
+      # nor injects this value.
+      TAPES_DATABASE_URL: ${SEARCH_DATABASE_URL:-postgres://cassette_search:cassette@postgres:5432/tapes?sslmode=disable}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  tapes:
+    # Tapes is built from its own tree, and the cassette from this
+    # repository. That they are separate build contexts is the same fact as
+    # the cassette having its own go.mod. Point TAPES_CONTEXT at your tapes
+    # checkout if it is not the sibling worktree assumed here.
+    build:
+      context: ${TAPES_CONTEXT:-../../tapes.git/main}
+      dockerfile: Dockerfile
+    command: >-
+      serve api
+      --listen 0.0.0.0:8081
+      --postgres postgres://tapes:tapes@postgres:5432/tapes?sslmode=disable
+      --cassettes http://search:9998/openapi
+      --cassette-refresh 10s
+    ports:
+      - "127.0.0.1:8081:8081"
+    # Only Postgres is required to start. The cassette is deliberately
+    # absent: core retries an unresolved source through startup and on every
+    # refresh, so a cassette that is slow, restarting, or briefly broken is
+    # an ordinary state rather than a boot failure.
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  ollama-data:

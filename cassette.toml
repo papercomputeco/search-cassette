@@ -1,0 +1,149 @@
+# The search cassette's publishable manifest.
+#
+# This is the authored form of the metadata this cassette serves at `/openapi`
+# under the `x-tapes-cassette` extension. It is the artifact a registry or an
+# orchestrator reads *before* anything is running: what image to pull, what
+# port it listens on, which contract of tapes it needs, and what a deployment
+# has to provision for it.
+#
+# This cassette is the extracted form of tapes' search surface: the semantic
+# span search endpoint (tapes' GET /v1/search/spans) and the embed worker
+# that keeps the span-embedding projection current. Unlike hello-world, it
+# has a real claim on tapes' data: `depends.views` names the span projection
+# it reads, and the tables it declares are the pgvector embedding tables it
+# owns in its own schema.
+#
+# The two encodings are one schema. `manifest_test.go` parses this very file
+# and the copy embedded in openapi.go and asserts they produce the same
+# canonical manifest digest, so they cannot drift apart silently.
+
+kind = "cassette/v1alpha1"
+
+# Who this cassette is, and what a deployment needs in order to run it.
+#
+# `name` is the identity everything else derives from: the route
+# (/v1/cassettes/search), the Postgres schema ("search"), and the role
+# ("cassette_search").
+[cassette]
+name = "search"
+version = "0.1.0"
+display_name = "Span Search"
+description = "Semantic span search over the tapes read model, extracted from tapes core."
+license = "Apache-2.0"
+homepage = "https://github.com/papercomputeco/search-cassette"
+image = "tapes/search-cassette:0.1.0"
+port = 9998
+
+# What this cassette needs from tapes.
+#
+# `core` is a major contract version, not a release. `views` are the contract
+# views this cassette wants SELECT on: the span projection it embeds and the
+# span-turn rollup it joins for turn context. The declaration derives the
+# grant plan (tapes_v1.spans, tapes_v1.span_turns); until those contract
+# views exist, the deployment grants the equivalent physical tables and the
+# cassette's spans_table/span_turns_table config points at them.
+[depends]
+core = "v1"
+views = ["spans", "span_turns"]
+
+# Where the things core needs live on this cassette's own listener.
+#
+# The cassette serves /api/search/spans; core republishes it as
+# /v1/cassettes/search/spans — the extracted twin of /v1/search/spans.
+[api]
+health = "/ping"
+openapi = "/openapi"
+prefix_path = "api"
+
+# Tables this cassette owns in its own schema: the pgvector embedding table
+# and its deterministic-failure sidecar. The cassette runs its own migration
+# for both at startup (including the pgvector HNSW index); core neither
+# creates the schema nor grants access to it.
+[[tables]]
+name = "span_embeddings"
+
+[[tables]]
+name = "span_embeddings_failures"
+
+# Configuration this cassette accepts, published as schema so a deployment
+# can render a form or validate values. Tapes never supplies these; the
+# deployment does, through the environment (key -> CASSETTE_* name, e.g.
+# embedding.model -> CASSETTE_EMBEDDING_MODEL).
+
+[[config]]
+key = "embedding.provider"
+type = "string"
+default = "ollama"
+enum = ["ollama", "openai"]
+description = "Embedding provider type."
+
+[[config]]
+key = "embedding.target"
+type = "string"
+description = "Embedding provider URL. Empty takes the provider default (Ollama: http://localhost:11434, OpenAI: https://api.openai.com)."
+
+[[config]]
+key = "embedding.model"
+type = "string"
+description = "Embedding model name. Empty takes the provider default (Ollama: embeddinggemma, OpenAI: text-embedding-3-large)."
+
+[[config]]
+key = "embedding.dimensions"
+type = "int"
+min = 1
+max = 16000
+description = "Embedding dimensionality; must match the model's output. Empty takes the provider default (Ollama: 768, OpenAI: 1024)."
+
+[[config]]
+key = "embedding.api_key"
+type = "string"
+secret = true
+description = "Embedding provider API key (required for OpenAI)."
+
+[[config]]
+key = "embed.interval"
+type = "duration"
+default = "1m"
+description = "How often to run a full span embed pass."
+
+[[config]]
+key = "embed.batch_size"
+type = "int"
+default = 100
+min = 1
+description = "Candidate page size; bounds peak memory per pass."
+
+[[config]]
+key = "embed.max_text_bytes"
+type = "int"
+default = 1048576
+description = "Cap on a span's rendered text; larger spans are recorded as too_large instead of chunked. Negative disables the guard."
+
+[[config]]
+key = "org"
+type = "string"
+description = "Only embed spans belonging to this org UUID (default: all orgs)."
+
+[[config]]
+key = "db.schema"
+type = "string"
+default = "search"
+description = "Cassette-owned schema the embedding tables live in. Set to \"-\" to use the connection's default search path (legacy tapes layout)."
+
+[[config]]
+key = "spans_table"
+type = "string"
+default = "spans_20260615"
+description = "Tapes span projection relation to read candidates from; may be schema-qualified."
+
+[[config]]
+key = "span_turns_table"
+type = "string"
+default = "span_turns_20260615"
+description = "Tapes span-turn projection relation to read turn context from; may be schema-qualified."
+
+[[config]]
+key = "wait_for_db"
+type = "bool"
+default = false
+description = "Retry an unreachable Postgres at startup with backoff instead of exiting."
