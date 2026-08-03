@@ -18,13 +18,11 @@ import (
 
 // fakeSpanSearcher implements SpanSearcher in memory.
 type fakeSpanSearcher struct {
-	hits    []spanembed.Hit
-	err     error
-	lastOrg string
+	hits []spanembed.Hit
+	err  error
 }
 
-func (f *fakeSpanSearcher) Search(_ context.Context, orgID string, _ []float32, _ int) ([]spanembed.Hit, error) {
-	f.lastOrg = orgID
+func (f *fakeSpanSearcher) Search(_ context.Context, _ []float32, _ int) ([]spanembed.Hit, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -85,7 +83,7 @@ var _ = Describe("handleSearchSpans", func() {
 		Expect(rec.Code).To(Equal(http.StatusBadRequest))
 	})
 
-	It("returns hits with their trace/turn context, scoped to the single tenant", func() {
+	It("returns hits with their trace/turn context", func() {
 		startedAt := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 		searcher.hits = []spanembed.Hit{{
 			TraceID:    "trc_req1",
@@ -113,10 +111,6 @@ var _ = Describe("handleSearchSpans", func() {
 		Expect(out.Results[0].UserPrompt).To(Equal("fix the retry backoff"))
 		Expect(out.Results[0].Snippet).To(ContainSubstring("max-poll-backoff"))
 		Expect(out.Results[0].StartedAt).To(Equal(startedAt))
-
-		// Span search is scoped to the tenant that owns this deployment,
-		// not to anything the caller can ask for.
-		Expect(searcher.lastOrg).To(Equal(singleTenantOrgID))
 	})
 
 	It("returns 500 on search failures", func() {

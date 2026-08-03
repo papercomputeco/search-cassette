@@ -100,7 +100,6 @@ func run(logger *slog.Logger) error {
 	store, err := spanembed.NewStore(pool, spanembed.StoreConfig{
 		Schema:         cfg.Schema,
 		Dimensions:     cfg.EmbeddingDimensions,
-		OrgID:          cfg.OrgID,
 		SpansTable:     cfg.SpansTable,
 		SpanTurnsTable: cfg.SpanTurnsTable,
 	}, logger)

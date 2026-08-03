@@ -15,8 +15,6 @@ import (
 	"github.com/papercomputeco/tapes/pkg/logger"
 )
 
-const testOrg = "11111111-1111-1111-1111-111111111111"
-
 // fakeStore implements spanembed.Source and spanembed.Sink in memory.
 type fakeStore struct {
 	candidates []spanembed.Candidate
@@ -43,7 +41,7 @@ func (f *fakeStore) ListCandidates(_ context.Context, after spanembed.Key, limit
 	var out []spanembed.Candidate
 	for _, c := range f.candidates {
 		key := c.Key()
-		if [3]string{key.OrgID, key.TraceID, key.SpanID} == [3]string{after.OrgID, after.TraceID, after.SpanID} {
+		if key == after {
 			continue
 		}
 		if keyLess(after, key) {
@@ -67,9 +65,6 @@ func (f *fakeStore) ListCandidates(_ context.Context, after spanembed.Key, limit
 }
 
 func keyLess(a, b spanembed.Key) bool {
-	if a.OrgID != b.OrgID {
-		return a.OrgID < b.OrgID
-	}
 	if a.TraceID != b.TraceID {
 		return a.TraceID < b.TraceID
 	}
@@ -143,7 +138,6 @@ func textBlocks(texts ...string) json.RawMessage {
 
 func mainSpan(trace, span string, input, output json.RawMessage) spanembed.Candidate {
 	return spanembed.Candidate{
-		OrgID:   testOrg,
 		TraceID: trace,
 		SpanID:  span,
 		Input:   input,
@@ -195,7 +189,6 @@ var _ = Describe("Pass", func() {
 			rec := store.records["trc_a|llm_1"]
 			Expect(rec.Model).To(Equal("m"))
 			Expect(rec.ContentHash).To(Equal(spanembed.ContentHash("fix the retry backoff\ndone, capped at 30s")))
-			Expect(rec.OrgID).To(Equal(testOrg))
 		})
 
 		It("skips spans whose delta renders to no text", func() {
@@ -232,7 +225,7 @@ var _ = Describe("Pass", func() {
 		It("re-embeds when the span's content changed", func() {
 			store.candidates = []spanembed.Candidate{
 				{
-					OrgID: testOrg, TraceID: "trc_a", SpanID: "llm_1",
+					TraceID: "trc_a", SpanID: "llm_1",
 					Input:         textBlocks("new content"),
 					ExistingHash:  spanembed.ContentHash("old content"),
 					ExistingModel: "m",
@@ -246,7 +239,7 @@ var _ = Describe("Pass", func() {
 		It("re-embeds when the configured model changed", func() {
 			store.candidates = []spanembed.Candidate{
 				{
-					OrgID: testOrg, TraceID: "trc_a", SpanID: "llm_1",
+					TraceID: "trc_a", SpanID: "llm_1",
 					Input:         textBlocks("same content"),
 					ExistingHash:  spanembed.ContentHash("same content"),
 					ExistingModel: "old-model",
@@ -263,7 +256,7 @@ var _ = Describe("Pass", func() {
 		It("skips a span that already failed under the same content and model", func() {
 			store.candidates = []spanembed.Candidate{
 				{
-					OrgID: testOrg, TraceID: "trc_a", SpanID: "llm_big",
+					TraceID: "trc_a", SpanID: "llm_big",
 					Input:             textBlocks("enormous prompt"),
 					ExistingFailHash:  spanembed.ContentHash("enormous prompt"),
 					ExistingFailModel: "m",
@@ -279,7 +272,7 @@ var _ = Describe("Pass", func() {
 		It("retries a poisoned span once its content changes", func() {
 			store.candidates = []spanembed.Candidate{
 				{
-					OrgID: testOrg, TraceID: "trc_a", SpanID: "llm_big",
+					TraceID: "trc_a", SpanID: "llm_big",
 					Input:             textBlocks("smaller prompt now"),
 					ExistingFailHash:  spanembed.ContentHash("the old enormous prompt"),
 					ExistingFailModel: "m",
@@ -413,12 +406,12 @@ var _ = Describe("Pass", func() {
 				mainSpan("trc_a", "llm_big", textBlocks(strings.Repeat("a", 30)), nil),
 				mainSpan("trc_a", "llm_empty", nil, json.RawMessage(`[{"type":"tool_use","tool_use_id":"t","tool_name":"Bash"}]`)),
 				{
-					OrgID: testOrg, TraceID: "trc_a", SpanID: "llm_dup",
+					TraceID: "trc_a", SpanID: "llm_dup",
 					Input:        textBlocks("unchanged"),
 					ExistingHash: spanembed.ContentHash("unchanged"), ExistingModel: "m",
 				},
 				{
-					OrgID: testOrg, TraceID: "trc_a", SpanID: "llm_pois",
+					TraceID: "trc_a", SpanID: "llm_pois",
 					Input:            textBlocks("bad"),
 					ExistingFailHash: spanembed.ContentHash("bad"), ExistingFailModel: "m",
 				},

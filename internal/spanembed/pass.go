@@ -203,7 +203,6 @@ func (p *Pass) processCandidate(ctx context.Context, c *Candidate, report *Repor
 	}
 
 	if err := p.sink.UpsertSpanChunks(ctx, ChunkRecord{
-		OrgID:       c.OrgID,
 		TraceID:     c.TraceID,
 		SpanID:      c.SpanID,
 		SessionID:   c.SessionID,
@@ -251,7 +250,6 @@ func (p *Pass) handleEmbedError(ctx context.Context, c *Candidate, hash string, 
 	reason := failureReason(apiErr)
 	report.FailuresByReason[reason]++
 	if err := p.sink.RecordFailure(ctx, FailureRecord{
-		OrgID:       c.OrgID,
 		TraceID:     c.TraceID,
 		SpanID:      c.SpanID,
 		SessionID:   c.SessionID,
@@ -289,7 +287,6 @@ func (p *Pass) recordTooLarge(ctx context.Context, c *Candidate, hash, text stri
 	report.Failed++
 	report.FailuresByReason[reasonTooLarge]++
 	if err := p.sink.RecordFailure(ctx, FailureRecord{
-		OrgID:       c.OrgID,
 		TraceID:     c.TraceID,
 		SpanID:      c.SpanID,
 		SessionID:   c.SessionID,

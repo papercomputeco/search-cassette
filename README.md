@@ -19,6 +19,13 @@ poisoning, orphan pruning), and the same Prometheus metric names
 (`tapes_embed_worker_*`). Nothing has been removed from tapes; this cassette
 is the extraction target running alongside it.
 
+One deliberate divergence: tapes#276 (v0.30.1) removed the organization
+concept, so this cassette is org-free from birth. Span identity is
+(`trace_id`, `span_id`) everywhere — its own tables carry no `org_id`
+column, and its reads of the span projection never reference one, so the
+cassette works identically before and after tapes ships the `org_id`
+DROP COLUMN migrations.
+
 ## What was extracted from where
 
 Search-owned code moved here (copied from tapes, now owned by this module):
@@ -41,8 +48,9 @@ Deliberate adaptations, all documented inline:
 
 - The embedding tables live in the cassette-owned `search` schema
   (`search.span_embeddings`, `search.span_embeddings_failures`) per the
-  cassette contract, instead of the default search path. Set
-  `CASSETTE_DB_SCHEMA="-"` to read/write a pre-cassette tapes layout.
+  cassette contract, instead of the default search path. They are created
+  org-free; a pre-cassette tapes `span_embeddings` table is not
+  layout-compatible and is re-embedded rather than reused.
 - The span projection relations the store reads are configurable
   (`CASSETTE_SPANS_TABLE`, `CASSETTE_SPAN_TURNS_TABLE`), defaulting to the
   current physical family (`spans_20260615`, `span_turns_20260615`). The
@@ -71,8 +79,7 @@ required.
 | `CASSETTE_EMBED_INTERVAL` | `1m` | Embed pass cadence |
 | `CASSETTE_EMBED_BATCH_SIZE` | `100` | Candidate page size |
 | `CASSETTE_EMBED_MAX_TEXT_BYTES` | `1048576` | Per-span rendered-text cap |
-| `CASSETTE_ORG` | all orgs | Scope the embed pass to one org UUID |
-| `CASSETTE_DB_SCHEMA` | `search` | Cassette-owned schema (`-` disables) |
+| `CASSETTE_DB_SCHEMA` | `search` | Cassette-owned schema for the embedding tables |
 | `CASSETTE_SPANS_TABLE` | `spans_20260615` | Span projection relation |
 | `CASSETTE_SPAN_TURNS_TABLE` | `span_turns_20260615` | Span-turn projection relation |
 | `CASSETTE_WAIT_FOR_DB` | `false` | Retry an unreachable Postgres at startup |

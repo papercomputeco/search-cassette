@@ -154,15 +154,10 @@ func manifest(name string) map[string]any {
 				"description": "Cap on a span's rendered text; larger spans are recorded as too_large instead of chunked. Negative disables the guard.",
 			},
 			{
-				"key":         "org",
-				"type":        "string",
-				"description": "Only embed spans belonging to this org UUID (default: all orgs).",
-			},
-			{
 				"key":         "db.schema",
 				"type":        "string",
 				"default":     "search",
-				"description": "Cassette-owned schema the embedding tables live in. Set to \"-\" to use the connection's default search path (legacy tapes layout).",
+				"description": "Cassette-owned schema the embedding tables live in.",
 			},
 			{
 				"key":         "spans_table",

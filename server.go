@@ -13,11 +13,6 @@ import (
 	"github.com/papercomputeco/search-cassette/internal/spanembed"
 )
 
-// singleTenantOrgID scopes every search to the tenant that owns this
-// deployment — the same all-zeros org tapes' single-tenant API uses. The
-// caller cannot pick a different org; span search is a tenant-facing read.
-const singleTenantOrgID = "00000000-0000-0000-0000-000000000000"
-
 // Span search — "find the turn where X happened". The query text is
 // embedded and matched against the span-embedding projection (main
 // llm spans only, delta-only content), and every hit carries its
@@ -55,7 +50,7 @@ type ErrorResponse struct {
 // SpanSearcher runs vector similarity over the embedded span projection.
 // *spanembed.Store implements it; tests substitute a fake.
 type SpanSearcher interface {
-	Search(ctx context.Context, orgID string, embedding []float32, topK int) ([]spanembed.Hit, error)
+	Search(ctx context.Context, embedding []float32, topK int) ([]spanembed.Hit, error)
 }
 
 // server is the cassette's HTTP surface: the two root anchors core probes
@@ -163,7 +158,7 @@ func (s *server) handleSearchSpans(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hits, err := s.searcher.Search(r.Context(), singleTenantOrgID, embedding, topK)
+	hits, err := s.searcher.Search(r.Context(), embedding, topK)
 	if errors.Is(err, spanembed.ErrNotInitialized) {
 		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
 			Error: err.Error(),

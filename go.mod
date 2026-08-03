@@ -7,7 +7,7 @@ require (
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/onsi/ginkgo/v2 v2.27.4
 	github.com/onsi/gomega v1.39.0
-	github.com/papercomputeco/tapes v0.29.1-0.20260731172125-6224e51e362e
+	github.com/papercomputeco/tapes v0.31.0
 	github.com/pgvector/pgvector-go v0.3.0
 	github.com/prometheus/client_golang v1.23.2
 )

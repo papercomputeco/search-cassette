@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
 	"strings"
 
@@ -48,10 +47,9 @@ var ErrNotInitialized = errors.New("span embeddings not initialized: the search 
 // StoreConfig configures a span-embedding store.
 type StoreConfig struct {
 	// Schema is the cassette-owned Postgres schema the embedding tables
-	// live in. Empty writes into the connection's default search path
-	// (tapes' historical layout); the cassette deployment sets it to the
-	// cassette name so the tables land in the schema the manifest
-	// declares.
+	// live in. Empty writes into the connection's default search path;
+	// the cassette deployment sets it to the cassette name so the tables
+	// land in the schema the manifest declares.
 	Schema string
 
 	// TableName defaults to DefaultTableName.
@@ -70,16 +68,18 @@ type StoreConfig struct {
 	// a deliberate, explicit pairing (e.g. text-embedding-3-large@1024
 	// in cloud, embeddinggemma@768 on a local/dev deployment).
 	Dimensions uint
-
-	// OrgID optionally scopes candidate listing and orphan pruning to
-	// one tenant. Empty embeds every org.
-	OrgID string
 }
 
 // Store reads and writes span embeddings in the tapes Postgres
 // database. The write path (EnsureSchema, Upsert, PruneOrphans)
-// belongs to the derive-side embed pass; the read path (Search) backs
-// the API's span search.
+// belongs to the embed pass; the read path (Search) backs the
+// cassette's span search.
+//
+// Span identity is (trace_id, span_id): tapes dropped the organization
+// concept (tapes#276), and while the projection tables may still carry a
+// sentinel org_id column until the drop migration ships, nothing here
+// reads or writes it — the store works identically before and after
+// that column disappears.
 type Store struct {
 	pool      *pgxpool.Pool
 	schema    string
@@ -88,8 +88,6 @@ type Store struct {
 	spans     pgx.Identifier
 	spanTurns pgx.Identifier
 	dims      uint
-	orgID     pgtype.UUID
-	scoped    bool
 	logger    *slog.Logger
 }
 
@@ -110,7 +108,7 @@ func NewStore(pool *pgxpool.Pool, cfg StoreConfig, log *slog.Logger) (*Store, er
 	if table == "" {
 		table = DefaultTableName
 	}
-	s := &Store{
+	return &Store{
 		pool:      pool,
 		schema:    cfg.Schema,
 		table:     qualified(cfg.Schema, table),
@@ -119,16 +117,7 @@ func NewStore(pool *pgxpool.Pool, cfg StoreConfig, log *slog.Logger) (*Store, er
 		spanTurns: relationIdentifier(cfg.SpanTurnsTable, DefaultSpanTurnsTable),
 		dims:      cfg.Dimensions,
 		logger:    log,
-	}
-	if cfg.OrgID != "" {
-		parsed, err := uuid.Parse(cfg.OrgID)
-		if err != nil {
-			return nil, fmt.Errorf("parse org id: %w", err)
-		}
-		s.orgID = pgtype.UUID{Bytes: parsed, Valid: true}
-		s.scoped = true
-	}
-	return s, nil
+	}, nil
 }
 
 // qualified builds the identifier for a cassette-owned table, inside the
@@ -213,7 +202,6 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 	// chunk_idx 0).
 	createTable := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s (
-			org_id       UUID NOT NULL,
 			trace_id     TEXT NOT NULL,
 			span_id      TEXT NOT NULL,
 			chunk_idx    INT NOT NULL DEFAULT 0,
@@ -222,15 +210,11 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 			content_hash TEXT NOT NULL,
 			embedded_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
 			embedding    vector(%d) NOT NULL,
-			PRIMARY KEY (org_id, trace_id, span_id, chunk_idx)
+			PRIMARY KEY (trace_id, span_id, chunk_idx)
 		)
 	`, table, s.dims)
 	if _, err := s.pool.Exec(ctx, createTable); err != nil {
 		return fmt.Errorf("creating table: %w", err)
-	}
-
-	if err := s.migrateChunkIdx(ctx); err != nil {
-		return err
 	}
 
 	if err := s.ensureFailuresTable(ctx); err != nil {
@@ -254,107 +238,6 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 	return nil
 }
 
-// migrateChunkIdx brings a pre-chunking table (PK on org/trace/span, one row
-// per span) up to the chunked layout in place. It is a no-op once the column
-// exists — which is always the case for a freshly created table — so it is
-// safe to run on every startup. Existing rows fall into chunk_idx 0, i.e. the
-// sole chunk of their span, which is exactly correct.
-func (s *Store) migrateChunkIdx(ctx context.Context) error {
-	// Fast path: the column is already present (always true for a freshly
-	// created table), so most startups never open a transaction.
-	hasColumn, err := s.hasChunkIdxColumn(ctx, s.pool)
-	if err != nil {
-		return err
-	}
-	if hasColumn {
-		return nil
-	}
-
-	table := s.table.Sanitize()
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin chunk_idx migration: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	// Serialize concurrent migrators (multiple embed-worker replicas, or the
-	// old and new pod during a rolling restart) so the check-then-ALTER is
-	// atomic: without this, both replicas see the column missing and the
-	// second's ADD COLUMN fails ("column already exists"), crashlooping the
-	// pod. The transaction-scoped lock releases on commit/rollback.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey(s.table.Sanitize())); err != nil {
-		return fmt.Errorf("locking chunk_idx migration: %w", err)
-	}
-	// Re-check under the lock — another replica may have migrated while we
-	// waited for it.
-	hasColumn, err = s.hasChunkIdxColumn(ctx, tx)
-	if err != nil {
-		return err
-	}
-	if hasColumn {
-		return tx.Commit(ctx) // already migrated; just release the lock
-	}
-
-	if _, err := tx.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN chunk_idx INT NOT NULL DEFAULT 0`, table)); err != nil {
-		return fmt.Errorf("adding chunk_idx column: %w", err)
-	}
-
-	// The original CREATE TABLE left the primary key unnamed, so Postgres
-	// auto-named it; look it up rather than assume "<table>_pkey".
-	var pkName string
-	if err := tx.QueryRow(ctx, `
-		SELECT conname FROM pg_constraint
-		WHERE conrelid = to_regclass($1) AND contype = 'p'
-	`, table).Scan(&pkName); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("finding primary key constraint: %w", err)
-	}
-	if pkName != "" {
-		if _, err := tx.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s DROP CONSTRAINT %s`, table, pgx.Identifier{pkName}.Sanitize())); err != nil {
-			return fmt.Errorf("dropping old primary key: %w", err)
-		}
-	}
-	if _, err := tx.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s ADD PRIMARY KEY (org_id, trace_id, span_id, chunk_idx)`, table)); err != nil {
-		return fmt.Errorf("adding chunked primary key: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit chunk_idx migration: %w", err)
-	}
-	s.logger.Info("migrated span embeddings to chunked layout", "table", table)
-	return nil
-}
-
-// rowQuerier is the QueryRow subset shared by *pgxpool.Pool and pgx.Tx, so the
-// chunk_idx check can run either outside a transaction (the fast path) or inside
-// the migration transaction (the re-check under the advisory lock).
-type rowQuerier interface {
-	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-}
-
-// hasChunkIdxColumn reports whether the embedding table already has the
-// chunk_idx column.
-func (s *Store) hasChunkIdxColumn(ctx context.Context, q rowQuerier) (bool, error) {
-	var has bool
-	if err := q.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM information_schema.columns
-			WHERE table_schema = COALESCE(NULLIF($2, ''), current_schema())
-			  AND table_name = $1 AND column_name = 'chunk_idx'
-		)
-	`, baseName(s.table), s.schema).Scan(&has); err != nil {
-		return false, fmt.Errorf("checking chunk_idx column: %w", err)
-	}
-	return has, nil
-}
-
-// advisoryLockKey derives a stable Postgres advisory-lock key from the table
-// name, namespaced so it can't collide with advisory locks taken elsewhere.
-func advisoryLockKey(table string) int64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte("spanembed.migrateChunkIdx:" + table))
-	return int64(h.Sum64()) // #nosec G115 -- any 64-bit value is a valid lock key
-}
-
 // ensureFailuresTable creates the sidecar that records deterministic embed
 // failures. A row here means "this span's content cannot be embedded under
 // this model, so don't keep retrying it every pass" — while preserving why,
@@ -363,7 +246,6 @@ func advisoryLockKey(table string) int64 {
 func (s *Store) ensureFailuresTable(ctx context.Context) error {
 	create := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s (
-			org_id          UUID NOT NULL,
 			trace_id        TEXT NOT NULL,
 			span_id         TEXT NOT NULL,
 			session_id      UUID,
@@ -375,7 +257,7 @@ func (s *Store) ensureFailuresTable(ctx context.Context) error {
 			attempts        INT NOT NULL DEFAULT 1,
 			first_failed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			last_failed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-			PRIMARY KEY (org_id, trace_id, span_id)
+			PRIMARY KEY (trace_id, span_id)
 		)
 	`, s.failures.Sanitize())
 	if _, err := s.pool.Exec(ctx, create); err != nil {
@@ -393,42 +275,29 @@ func (s *Store) ensureFailuresTable(ctx context.Context) error {
 func (s *Store) ListCandidates(ctx context.Context, after Key, limit int) ([]Candidate, error) {
 	table := s.table.Sanitize()
 	query := fmt.Sprintf(`
-		SELECT s.org_id, s.trace_id, s.span_id, s.session_id, s.input, s.output,
+		SELECT s.trace_id, s.span_id, s.session_id, s.input, s.output,
 		       COALESCE(e.content_hash, ''), COALESCE(e.model, ''),
 		       COALESCE(f.content_hash, ''), COALESCE(f.model, '')
 		FROM `+s.spans.Sanitize()+` s
 		LEFT JOIN (
-			SELECT org_id, trace_id, span_id,
+			SELECT trace_id, span_id,
 			       max(content_hash) AS content_hash, max(model) AS model
 			FROM %s
-			GROUP BY org_id, trace_id, span_id
+			GROUP BY trace_id, span_id
 		) e
-		  ON e.org_id = s.org_id AND e.trace_id = s.trace_id AND e.span_id = s.span_id
+		  ON e.trace_id = s.trace_id AND e.span_id = s.span_id
 		LEFT JOIN %s f
-		  ON f.org_id = s.org_id AND f.trace_id = s.trace_id AND f.span_id = s.span_id
+		  ON f.trace_id = s.trace_id AND f.span_id = s.span_id
 		WHERE s.kind = 'llm' AND s.call_kind = 'main'
-		  AND (s.org_id, s.trace_id, s.span_id) > (@org, @trace, @span)
-		  AND (NOT @scoped::boolean OR s.org_id = @scope_org)
-		ORDER BY s.org_id, s.trace_id, s.span_id
+		  AND (s.trace_id, s.span_id) > (@trace, @span)
+		ORDER BY s.trace_id, s.span_id
 		LIMIT @page
 	`, table, s.failures.Sanitize())
 
-	afterOrg := pgtype.UUID{Valid: true} // nil UUID sorts first
-	if after.OrgID != "" {
-		parsed, err := uuid.Parse(after.OrgID)
-		if err != nil {
-			return nil, fmt.Errorf("parse cursor org id: %w", err)
-		}
-		afterOrg = pgtype.UUID{Bytes: parsed, Valid: true}
-	}
-
 	rows, err := s.pool.Query(ctx, query, pgx.NamedArgs{
-		"org":       afterOrg,
-		"trace":     after.TraceID,
-		"span":      after.SpanID,
-		"scoped":    s.scoped,
-		"scope_org": s.orgID,
-		"page":      limit,
+		"trace": after.TraceID,
+		"span":  after.SpanID,
+		"page":  limit,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("listing embed candidates: %w", err)
@@ -439,16 +308,14 @@ func (s *Store) ListCandidates(ctx context.Context, after Key, limit int) ([]Can
 	for rows.Next() {
 		var (
 			c                   Candidate
-			org                 pgtype.UUID
 			session             pgtype.UUID
 			inp, outp           []byte
 			hash, mdl           string
 			failHash, failModel string
 		)
-		if err := rows.Scan(&org, &c.TraceID, &c.SpanID, &session, &inp, &outp, &hash, &mdl, &failHash, &failModel); err != nil {
+		if err := rows.Scan(&c.TraceID, &c.SpanID, &session, &inp, &outp, &hash, &mdl, &failHash, &failModel); err != nil {
 			return nil, fmt.Errorf("scanning embed candidate: %w", err)
 		}
-		c.OrgID = uuid.UUID(org.Bytes).String()
 		if session.Valid {
 			c.SessionID = uuid.UUID(session.Bytes).String()
 		}
@@ -476,10 +343,6 @@ func (s *Store) UpsertSpanChunks(ctx context.Context, rec ChunkRecord) error {
 	if len(rec.Embeddings) == 0 {
 		return fmt.Errorf("upserting span embedding %s/%s: no embeddings", rec.TraceID, rec.SpanID)
 	}
-	org, err := uuid.Parse(rec.OrgID)
-	if err != nil {
-		return fmt.Errorf("parse org id: %w", err)
-	}
 	session := pgtype.UUID{}
 	if rec.SessionID != "" {
 		parsed, err := uuid.Parse(rec.SessionID)
@@ -491,19 +354,18 @@ func (s *Store) UpsertSpanChunks(ctx context.Context, rec ChunkRecord) error {
 
 	table := s.table.Sanitize()
 	insert := fmt.Sprintf(`
-		INSERT INTO %s (org_id, trace_id, span_id, chunk_idx, session_id, model, content_hash, embedding, embedded_at)
-		VALUES (@org, @trace, @span, @chunk, @session, @model, @hash, @embedding, now())
-		ON CONFLICT (org_id, trace_id, span_id, chunk_idx) DO UPDATE SET
+		INSERT INTO %s (trace_id, span_id, chunk_idx, session_id, model, content_hash, embedding, embedded_at)
+		VALUES (@trace, @span, @chunk, @session, @model, @hash, @embedding, now())
+		ON CONFLICT (trace_id, span_id, chunk_idx) DO UPDATE SET
 			session_id   = EXCLUDED.session_id,
 			model        = EXCLUDED.model,
 			content_hash = EXCLUDED.content_hash,
 			embedding    = EXCLUDED.embedding,
 			embedded_at  = now()
 	`, table)
-	pruneTail := fmt.Sprintf(`DELETE FROM %s WHERE org_id = @org AND trace_id = @trace AND span_id = @span AND chunk_idx >= @count`, table)
-	clearFailure := fmt.Sprintf(`DELETE FROM %s WHERE org_id = @org AND trace_id = @trace AND span_id = @span`, s.failures.Sanitize())
+	pruneTail := fmt.Sprintf(`DELETE FROM %s WHERE trace_id = @trace AND span_id = @span AND chunk_idx >= @count`, table)
+	clearFailure := fmt.Sprintf(`DELETE FROM %s WHERE trace_id = @trace AND span_id = @span`, s.failures.Sanitize())
 
-	orgArg := pgtype.UUID{Bytes: org, Valid: true}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin span embedding write: %w", err)
@@ -512,7 +374,6 @@ func (s *Store) UpsertSpanChunks(ctx context.Context, rec ChunkRecord) error {
 
 	for i, embedding := range rec.Embeddings {
 		if _, err := tx.Exec(ctx, insert, pgx.NamedArgs{
-			"org":       orgArg,
 			"trace":     rec.TraceID,
 			"span":      rec.SpanID,
 			"chunk":     i,
@@ -525,7 +386,6 @@ func (s *Store) UpsertSpanChunks(ctx context.Context, rec ChunkRecord) error {
 		}
 	}
 	if _, err := tx.Exec(ctx, pruneTail, pgx.NamedArgs{
-		"org":   orgArg,
 		"trace": rec.TraceID,
 		"span":  rec.SpanID,
 		"count": len(rec.Embeddings),
@@ -533,7 +393,6 @@ func (s *Store) UpsertSpanChunks(ctx context.Context, rec ChunkRecord) error {
 		return fmt.Errorf("pruning stale chunks for %s/%s: %w", rec.TraceID, rec.SpanID, err)
 	}
 	if _, err := tx.Exec(ctx, clearFailure, pgx.NamedArgs{
-		"org":   orgArg,
 		"trace": rec.TraceID,
 		"span":  rec.SpanID,
 	}); err != nil {
@@ -551,10 +410,6 @@ func (s *Store) UpsertSpanChunks(ctx context.Context, rec ChunkRecord) error {
 // content (hash) or model changes; attempts accrue across passes so the table
 // shows how persistent the failure is.
 func (s *Store) RecordFailure(ctx context.Context, rec FailureRecord) error {
-	org, err := uuid.Parse(rec.OrgID)
-	if err != nil {
-		return fmt.Errorf("parse org id: %w", err)
-	}
 	session := pgtype.UUID{}
 	if rec.SessionID != "" {
 		parsed, err := uuid.Parse(rec.SessionID)
@@ -569,9 +424,9 @@ func (s *Store) RecordFailure(ctx context.Context, rec FailureRecord) error {
 	}
 
 	query := fmt.Sprintf(`
-		INSERT INTO %s (org_id, trace_id, span_id, session_id, model, content_hash, reason, error_detail, token_count)
-		VALUES (@org, @trace, @span, @session, @model, @hash, @reason, @detail, @tokens)
-		ON CONFLICT (org_id, trace_id, span_id) DO UPDATE SET
+		INSERT INTO %s (trace_id, span_id, session_id, model, content_hash, reason, error_detail, token_count)
+		VALUES (@trace, @span, @session, @model, @hash, @reason, @detail, @tokens)
+		ON CONFLICT (trace_id, span_id) DO UPDATE SET
 			session_id     = EXCLUDED.session_id,
 			model          = EXCLUDED.model,
 			content_hash   = EXCLUDED.content_hash,
@@ -583,7 +438,6 @@ func (s *Store) RecordFailure(ctx context.Context, rec FailureRecord) error {
 	`, s.failures.Sanitize(), s.failures.Sanitize())
 
 	if _, err := s.pool.Exec(ctx, query, pgx.NamedArgs{
-		"org":     pgtype.UUID{Bytes: org, Valid: true},
 		"trace":   rec.TraceID,
 		"span":    rec.SpanID,
 		"session": session,
@@ -603,15 +457,13 @@ func (s *Store) RecordFailure(ctx context.Context, rec FailureRecord) error {
 // embeddable set. Returns the total number of rows removed across both tables.
 func (s *Store) PruneOrphans(ctx context.Context) (int64, error) {
 	orphanFilter := `
-		WHERE (NOT @scoped::boolean OR e.org_id = @scope_org)
-		  AND NOT EXISTS (
+		WHERE NOT EXISTS (
 			SELECT 1 FROM ` + s.spans.Sanitize() + ` s
-			WHERE s.org_id = e.org_id AND s.trace_id = e.trace_id AND s.span_id = e.span_id
+			WHERE s.trace_id = e.trace_id AND s.span_id = e.span_id
 			  AND s.kind = 'llm' AND s.call_kind = 'main'
 		)`
-	args := pgx.NamedArgs{"scoped": s.scoped, "scope_org": s.orgID}
 
-	tag, err := s.pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s e%s`, s.table.Sanitize(), orphanFilter), args)
+	tag, err := s.pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s e%s`, s.table.Sanitize(), orphanFilter))
 	if err != nil {
 		if isUndefinedTable(err) {
 			return 0, nil // nothing embedded yet, nothing to prune
@@ -620,7 +472,7 @@ func (s *Store) PruneOrphans(ctx context.Context) (int64, error) {
 	}
 	pruned := tag.RowsAffected()
 
-	failTag, err := s.pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s e%s`, s.failures.Sanitize(), orphanFilter), args)
+	failTag, err := s.pool.Exec(ctx, fmt.Sprintf(`DELETE FROM %s e%s`, s.failures.Sanitize(), orphanFilter))
 	if err != nil {
 		if isUndefinedTable(err) {
 			return pruned, nil
@@ -638,15 +490,10 @@ const searchOverfetch = 4
 // Search returns the topK spans most similar to the query embedding, joined
 // with their trace context (turn prompt and span payloads for the snippet).
 // A span may have several chunk embeddings; results collapse to one hit per
-// span, scored by the span's best-matching chunk. Scoped to one org — search is
-// a tenant-facing read.
-func (s *Store) Search(ctx context.Context, orgID string, embedding []float32, topK int) ([]Hit, error) {
+// span, scored by the span's best-matching chunk.
+func (s *Store) Search(ctx context.Context, embedding []float32, topK int) ([]Hit, error) {
 	if topK <= 0 {
 		topK = 5
-	}
-	org, err := uuid.Parse(orgID)
-	if err != nil {
-		return nil, fmt.Errorf("parse org id: %w", err)
 	}
 
 	table := s.table.Sanitize()
@@ -655,7 +502,6 @@ func (s *Store) Search(ctx context.Context, orgID string, embedding []float32, t
 			SELECT e.trace_id, e.span_id, e.session_id,
 			       e.embedding <=> @embedding AS dist
 			FROM %s e
-			WHERE e.org_id = @org
 			ORDER BY e.embedding <=> @embedding
 			LIMIT @fetch
 		),
@@ -669,15 +515,14 @@ func (s *Store) Search(ctx context.Context, orgID string, embedding []float32, t
 		       t.user_prompt, s.model, s.started_at, s.input, s.output
 		FROM best b
 		JOIN `+s.spans.Sanitize()+` s
-		  ON s.org_id = @org AND s.trace_id = b.trace_id AND s.span_id = b.span_id
+		  ON s.trace_id = b.trace_id AND s.span_id = b.span_id
 		JOIN `+s.spanTurns.Sanitize()+` t
-		  ON t.org_id = @org AND t.trace_id = b.trace_id
+		  ON t.trace_id = b.trace_id
 		ORDER BY b.dist
 		LIMIT @topk
 	`, table)
 
 	rows, err := s.pool.Query(ctx, query, pgx.NamedArgs{
-		"org":       pgtype.UUID{Bytes: org, Valid: true},
 		"embedding": pgvectorgo.NewVector(embedding),
 		"fetch":     topK * searchOverfetch,
 		"topk":      topK,

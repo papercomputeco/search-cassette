@@ -2,8 +2,8 @@
 //
 // Embeddings are a derived-side concern: the derive/worker family is
 // the single writer (the ingest hot path never embeds), and every
-// embedding is keyed by deterministic span identity (org_id, trace_id,
-// span_id) so the pass is idempotent — re-deriving or re-running
+// embedding is keyed by deterministic span identity (trace_id, span_id)
+// so the pass is idempotent — re-deriving or re-running
 // embeds each span exactly once, skipping identities whose content,
 // model, and dimensions are already current.
 //
@@ -30,7 +30,6 @@ import (
 // Candidate is one main llm span considered for embedding, joined with
 // its existing embedding row (zero values when not yet embedded).
 type Candidate struct {
-	OrgID     string
 	TraceID   string
 	SpanID    string
 	SessionID string // "" when the span derived without attribution
@@ -55,14 +54,13 @@ type Candidate struct {
 
 // Key orders candidates for keyset pagination.
 type Key struct {
-	OrgID   string
 	TraceID string
 	SpanID  string
 }
 
 // Key returns the candidate's pagination key.
 func (c *Candidate) Key() Key {
-	return Key{OrgID: c.OrgID, TraceID: c.TraceID, SpanID: c.SpanID}
+	return Key{TraceID: c.TraceID, SpanID: c.SpanID}
 }
 
 // ChunkRecord is one span's embedding write. A span that fit the model's
@@ -70,7 +68,6 @@ func (c *Candidate) Key() Key {
 // pieces and carries one embedding per piece, stored under chunk_idx 0..N-1 in
 // slice order.
 type ChunkRecord struct {
-	OrgID       string
 	TraceID     string
 	SpanID      string
 	SessionID   string
@@ -83,7 +80,6 @@ type ChunkRecord struct {
 // retrying the span while keeping the loss observable: why it failed, how big
 // the input was, and (via the store) how many times it has failed.
 type FailureRecord struct {
-	OrgID       string
 	TraceID     string
 	SpanID      string
 	SessionID   string

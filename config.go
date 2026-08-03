@@ -41,9 +41,7 @@ type cassetteConfig struct {
 
 	// Schema is the cassette-owned schema the embedding tables live in.
 	// Defaults to the cassette name, matching the manifest's derived
-	// grant plan. Set it to "" (CASSETTE_DB_SCHEMA="-") only when
-	// pointing at a pre-cassette tapes deployment whose span_embeddings
-	// table lives on the default search path.
+	// grant plan.
 	Schema string
 
 	// SpansTable and SpanTurnsTable name the tapes span projection
@@ -62,14 +60,7 @@ type cassetteConfig struct {
 	EmbedInterval     time.Duration
 	EmbedBatchSize    int
 	EmbedMaxTextBytes int
-
-	// OrgID optionally scopes the embed pass to one tenant.
-	OrgID string
 }
-
-// schemaDisabled is the CASSETTE_DB_SCHEMA sentinel that opts out of a
-// cassette-owned schema entirely (legacy default-search-path layout).
-const schemaDisabled = "-"
 
 // loadConfig reads the cassette's configuration from the environment.
 func loadConfig() (cassetteConfig, error) {
@@ -85,8 +76,6 @@ func loadConfig() (cassetteConfig, error) {
 		EmbeddingTarget:   strings.TrimSpace(os.Getenv("CASSETTE_EMBEDDING_TARGET")),
 		EmbeddingModel:    strings.TrimSpace(os.Getenv("CASSETTE_EMBEDDING_MODEL")),
 		EmbeddingAPIKey:   strings.TrimSpace(os.Getenv("CASSETTE_EMBEDDING_API_KEY")),
-
-		OrgID: strings.TrimSpace(os.Getenv("CASSETTE_ORG")),
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -94,9 +83,6 @@ func loadConfig() (cassetteConfig, error) {
 	}
 
 	cfg.Schema = envOrDefault("CASSETTE_DB_SCHEMA", cfg.Name)
-	if cfg.Schema == schemaDisabled {
-		cfg.Schema = ""
-	}
 
 	var err error
 	if cfg.WaitForDB, err = envBool("CASSETTE_WAIT_FOR_DB", false); err != nil {
