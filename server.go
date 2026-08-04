@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -12,6 +13,12 @@ import (
 	"github.com/papercomputeco/search-cassette/internal/embeddings"
 	"github.com/papercomputeco/search-cassette/internal/spanembed"
 )
+
+// maxTopK bounds a search request's result count, mirroring the max page
+// size of tapes' keyset-paginated list endpoints. An unbounded top_k would
+// let one request buy an arbitrarily expensive vector scan — and overflow
+// the store's overfetch multiplication into a negative LIMIT.
+const maxTopK = 100
 
 // Span search — "find the turn where X happened". The query text is
 // embedded and matched against the span-embedding projection (main
@@ -141,9 +148,9 @@ func (s *server) handleSearchSpans(w http.ResponseWriter, r *http.Request) {
 	topK := 5
 	if topKStr := r.URL.Query().Get("top_k"); topKStr != "" {
 		parsed, err := strconv.Atoi(topKStr)
-		if err != nil || parsed <= 0 {
+		if err != nil || parsed <= 0 || parsed > maxTopK {
 			writeJSON(w, http.StatusBadRequest, ErrorResponse{
-				Error: "top_k must be a positive integer",
+				Error: fmt.Sprintf("top_k must be a positive integer no greater than %d", maxTopK),
 			})
 			return
 		}

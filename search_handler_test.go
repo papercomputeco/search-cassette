@@ -83,6 +83,21 @@ var _ = Describe("handleSearchSpans", func() {
 		Expect(rec.Code).To(Equal(http.StatusBadRequest))
 	})
 
+	It("returns 400 when top_k exceeds the maximum", func() {
+		rec := get(handler, "/api/search/spans?query=x&top_k=101")
+		Expect(rec.Code).To(Equal(http.StatusBadRequest))
+
+		// An overflow-sized value must be rejected, not multiplied into a
+		// negative store limit.
+		rec = get(handler, "/api/search/spans?query=x&top_k=4611686018427387903")
+		Expect(rec.Code).To(Equal(http.StatusBadRequest))
+	})
+
+	It("accepts top_k at the maximum", func() {
+		rec := get(handler, "/api/search/spans?query=x&top_k=100")
+		Expect(rec.Code).To(Equal(http.StatusOK))
+	})
+
 	It("returns hits with their trace/turn context", func() {
 		startedAt := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 		searcher.hits = []spanembed.Hit{{

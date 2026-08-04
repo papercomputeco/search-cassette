@@ -51,7 +51,7 @@ func openAPIDocument(name string) []byte {
 			Tag("search").
 			QueryParam("query", oas.String(), oas.ParamRequired(),
 				oas.ParamDescription("Search query")).
-			QueryParam("top_k", oas.Integer(oas.Minimum(1), oas.Default(5)),
+			QueryParam("top_k", oas.Integer(oas.Minimum(1), oas.Maximum(maxTopK), oas.Default(5)),
 				oas.ParamDescription("Maximum number of results to return")).
 			JSONResponse(200, "Search hits", parser.Schema(SpanSearchOutput{})).
 			JSONResponse(400, "Missing or invalid query parameters", parser.Schema(ErrorResponse{})).
