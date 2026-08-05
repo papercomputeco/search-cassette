@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,11 +19,13 @@ import (
 
 // fakeSpanSearcher implements SpanSearcher in memory.
 type fakeSpanSearcher struct {
-	hits []spanembed.Hit
-	err  error
+	hits     []spanembed.Hit
+	err      error
+	lastTopK int
 }
 
-func (f *fakeSpanSearcher) Search(_ context.Context, _ []float32, _ int) ([]spanembed.Hit, error) {
+func (f *fakeSpanSearcher) Search(_ context.Context, _ []float32, topK int) ([]spanembed.Hit, error) {
+	f.lastTopK = topK
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -53,6 +56,11 @@ var _ = Describe("handleSearchSpans", func() {
 	get := func(h http.Handler, target string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+		return rec
+	}
+	post := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/search/spans", bytes.NewBufferString(body)))
 		return rec
 	}
 
@@ -126,6 +134,32 @@ var _ = Describe("handleSearchSpans", func() {
 		Expect(out.Results[0].UserPrompt).To(Equal("fix the retry backoff"))
 		Expect(out.Results[0].Snippet).To(ContainSubstring("max-poll-backoff"))
 		Expect(out.Results[0].StartedAt).To(Equal(startedAt))
+	})
+
+	It("serves the cassette-advertised MCP search facade", func() {
+		searcher.hits = []spanembed.Hit{{TraceID: "trace-1", SpanID: "span-1"}}
+		rec := post(`{"query":"retry backoff","top_k":3}`)
+		Expect(rec.Code).To(Equal(http.StatusOK))
+		Expect(searcher.lastTopK).To(Equal(3))
+
+		var out SpanSearchOutput
+		Expect(json.Unmarshal(rec.Body.Bytes(), &out)).To(Succeed())
+		Expect(out.Query).To(Equal("retry backoff"))
+		Expect(out.Results[0].SpanID).To(Equal("span-1"))
+		Expect(rec.Body.String()).NotTo(ContainSubstring("user_prompt"))
+	})
+
+	It("defaults the MCP tool's top_k to 5", func() {
+		Expect(post(`{"query":"x"}`).Code).To(Equal(http.StatusOK))
+		Expect(searcher.lastTopK).To(Equal(5))
+		Expect(post(`{"query":"x","top_k":-1}`).Code).To(Equal(http.StatusOK))
+		Expect(searcher.lastTopK).To(Equal(5))
+	})
+
+	It("rejects MCP arguments outside the advertised schema", func() {
+		Expect(post(`{"top_k":3}`).Code).To(Equal(http.StatusBadRequest))
+		Expect(post(`{"query":"x","unknown":true}`).Code).To(Equal(http.StatusBadRequest))
+		Expect(post(`{"query":"x","top_k":null}`).Code).To(Equal(http.StatusBadRequest))
 	})
 
 	It("returns 500 on search failures", func() {

@@ -64,4 +64,25 @@ var _ = Describe("cassette manifest", func() {
 				"path %q escapes the cassette prefix", path)
 		}
 	})
+
+	It("advertises the legacy MCP search through an OpenAPI 3.1 POST", func() {
+		var doc struct {
+			OpenAPI string `json:"openapi"`
+			Paths   map[string]struct {
+				Post struct {
+					Extension struct {
+						Name string `json:"name"`
+					} `json:"x-tapes-mcp"`
+					RequestBody struct {
+						Required bool `json:"required"`
+					} `json:"requestBody"`
+				} `json:"post"`
+			} `json:"paths"`
+		}
+		Expect(json.Unmarshal(openAPIDocument("search"), &doc)).To(Succeed())
+		Expect(doc.OpenAPI).To(Equal("3.1.0"))
+		operation := doc.Paths["/api/search/spans"].Post
+		Expect(operation.Extension.Name).To(Equal("search"))
+		Expect(operation.RequestBody.Required).To(BeTrue())
+	})
 })

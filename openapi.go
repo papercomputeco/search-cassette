@@ -11,13 +11,13 @@ import (
 // the OpenAPI info block.
 const cassetteVersion = "0.1.0"
 
+const searchToolDescription = "Semantic search over stored LLM sessions. Embeds the query and runs vector similarity over the span projection (main-conversation LLM spans, delta-only content). Each result is an individual span carrying its session, trace, and span identifiers plus a text snippet, so a client can jump straight to the matched turn."
+
 // openAPIDocument renders this cassette's OpenAPI document.
 //
 // Every path is written under /api/<name>, which is what core's prefix
-// admission requires. The operation mirrors tapes' GET /v1/search/spans
-// registration one for one — same operation ID, parameters, response schema,
-// and status codes — so a client moving from /v1/search/spans to
-// /v1/cassettes/search/spans sees the same contract.
+// admission requires. GET mirrors tapes' /v1/search/spans contract; POST is
+// the JSON-body facade advertised as the cassette's MCP search tool.
 //
 // The manifest core admits the cassette on rides inside the document as a
 // root extension, so there is one artifact to fetch and one thing to
@@ -60,12 +60,38 @@ func openAPIDocument(name string) []byte {
 			Build(),
 		provenance)
 
+	// x-tapes-mcp admits JSON-body POST operations, so this is a thin facade
+	// over the same search path rather than a second implementation.
+	_ = parser.AddOperation("POST", prefix+"/spans",
+		oas.NewOperation("searchSpansMCP").
+			Summary("Semantic search over stored LLM sessions").
+			Description(searchToolDescription).
+			Tag("search").
+			Extension("x-tapes-mcp", map[string]any{
+				"name": "search",
+				"annotations": map[string]any{
+					"readOnlyHint":   true,
+					"idempotentHint": true,
+					"openWorldHint":  false,
+				},
+			}).
+			JSONBody("Search arguments", oas.Object(map[string]*oas.Schema{
+				"query": oas.String(oas.Description("the search query text to find relevant spans")),
+				"top_k": oas.Integer(oas.Description("number of results to return (default: 5)")),
+			}, oas.Required("query"), oas.NoAdditionalProperties())).
+			JSONResponse(200, "Search hits", parser.Schema(mcpSearchOutput{})).
+			JSONResponse(400, "Invalid search arguments", parser.Schema(ErrorResponse{})).
+			JSONResponse(500, "Search execution failed", parser.Schema(ErrorResponse{})).
+			JSONResponse(503, "Span search is not configured or not yet initialized", parser.Schema(ErrorResponse{})).
+			Build(),
+		provenance)
+
 	// Compile is a pure function of what was added above, and every Add here
 	// is a literal that cannot fail — so an error would mean this function is
 	// wrong, not that the request is. Serving an empty body in that case would
 	// hide it; core reports a cassette whose document does not parse, which is
 	// the louder and more useful failure.
-	compiled, err := parser.Compile(context.Background(), oas.WithTarget(oas.V30))
+	compiled, err := parser.Compile(context.Background(), oas.WithTarget(oas.V31))
 	if err != nil {
 		return []byte(`{"error":"could not compile this cassette's OpenAPI document: ` +
 			strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`)
