@@ -77,7 +77,7 @@ func openAPIDocument(name string) []byte {
 			}).
 			JSONBody("Search arguments", oas.Object(map[string]*oas.Schema{
 				"query": oas.String(oas.Description("the search query text to find relevant spans")),
-				"top_k": oas.Integer(oas.Description("number of results to return (default: 5)")),
+				"top_k": oas.Integer(oas.Maximum(maxTopK), oas.Description("number of results to return (default: 5)")),
 			}, oas.Required("query"), oas.NoAdditionalProperties())).
 			JSONResponse(200, "Search hits", parser.Schema(mcpSearchOutput{})).
 			JSONResponse(400, "Invalid search arguments", parser.Schema(ErrorResponse{})).

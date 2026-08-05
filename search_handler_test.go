@@ -160,6 +160,13 @@ var _ = Describe("handleSearchSpans", func() {
 		Expect(post(`{"top_k":3}`).Code).To(Equal(http.StatusBadRequest))
 		Expect(post(`{"query":"x","unknown":true}`).Code).To(Equal(http.StatusBadRequest))
 		Expect(post(`{"query":"x","top_k":null}`).Code).To(Equal(http.StatusBadRequest))
+		Expect(post(`{"query":"x","top_k":101}`).Code).To(Equal(http.StatusBadRequest))
+		Expect(post(`{"query":"x","top_k":4611686018427387903}`).Code).To(Equal(http.StatusBadRequest))
+	})
+
+	It("accepts the MCP top_k maximum", func() {
+		Expect(post(`{"query":"x","top_k":100}`).Code).To(Equal(http.StatusOK))
+		Expect(searcher.lastTopK).To(Equal(maxTopK))
 	})
 
 	It("returns 500 on search failures", func() {

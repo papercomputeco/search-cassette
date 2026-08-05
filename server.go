@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -170,16 +169,12 @@ func (s *server) handleSearchSpans(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	topK := 5
-	if topKStr := r.URL.Query().Get("top_k"); topKStr != "" {
-		parsed, err := strconv.Atoi(topKStr)
-		if err != nil || parsed <= 0 || parsed > maxTopK {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{
-				Error: fmt.Sprintf("top_k must be a positive integer no greater than %d", maxTopK),
-			})
-			return
-		}
-		topK = parsed
+	topK, err := parseTopK(r.URL.Query().Get("top_k"))
+	if err != nil || topK <= 0 {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error: fmt.Sprintf("top_k must be a positive integer no greater than %d", maxTopK),
+		})
+		return
 	}
 
 	output, err := s.searchSpans(r.Context(), query, topK)
@@ -220,15 +215,15 @@ func (s *server) handleMCPSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	topK := 5
-	if input.TopK != nil {
-		if bytes.Equal(bytes.TrimSpace(input.TopK), []byte("null")) || json.Unmarshal(input.TopK, &topK) != nil {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "top_k must be an integer"})
-			return
-		}
-		if topK <= 0 {
-			topK = 5
-		}
+	topK, err := parseTopK(string(input.TopK))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error: fmt.Sprintf("top_k must be an integer no greater than %d", maxTopK),
+		})
+		return
+	}
+	if topK <= 0 {
+		topK = 5
 	}
 	output, err := s.searchSpans(r.Context(), *input.Query, topK)
 	if errors.Is(err, spanembed.ErrNotInitialized) {
@@ -248,6 +243,19 @@ func (s *server) handleMCPSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, mcpSearchOutput{Query: output.Query, Results: results, Count: output.Count})
+}
+
+// parseTopK applies the default and shared work limit. Callers retain their
+// existing non-positive semantics: GET rejects them; legacy MCP defaults them.
+func parseTopK(raw string) (int, error) {
+	if raw == "" {
+		return 5, nil
+	}
+	topK, err := strconv.Atoi(raw)
+	if err != nil || topK > maxTopK {
+		return 0, errors.New("invalid top_k")
+	}
+	return topK, nil
 }
 
 func (s *server) searchSpans(ctx context.Context, query string, topK int) (SpanSearchOutput, error) {
