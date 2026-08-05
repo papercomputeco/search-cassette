@@ -5,12 +5,17 @@ The tapes span-search surface, extracted into a
 an independently deployed HTTP service that tapes admits from its OpenAPI
 document and reverse-proxies under `/v1/cassettes/search`.
 
-It is a 1:1 port of two things tapes core ships today:
+It is a 1:1 port of three things tapes core ships today:
 
 | tapes core | this cassette |
 | --- | --- |
 | `GET /v1/search/spans` | `GET /v1/cassettes/search/spans` (served locally as `GET /api/search/spans`) |
+| MCP `search` tool | cassette-advertised MCP `search.search` tool (served locally as `POST /api/search/spans`) |
 | `tapes serve embed-worker` | the embed pass loop, run in-process on its own interval |
+
+The MCP tool accepts the same `query` and optional `top_k` arguments and returns
+that same span-shaped structured result. The cassette-qualified name is assigned
+by tapes from the cassette name plus the operation's `x-tapes-mcp.name`.
 
 Same query parameters (`query`, `top_k`), same response shape
 (`SpanSearchOutput`), same status semantics (400/500/503), same embed-pass

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -46,6 +47,28 @@ type SpanSearchOutput struct {
 	Query   string             `json:"query"`
 	Results []SpanSearchResult `json:"results"`
 	Count   int                `json:"count"`
+}
+
+type mcpSearchRequest struct {
+	Query *string         `json:"query"`
+	TopK  json.RawMessage `json:"top_k,omitempty"`
+}
+
+type mcpSearchResult struct {
+	SessionID  string    `json:"session_id,omitempty"`
+	TraceID    string    `json:"trace_id"`
+	SpanID     string    `json:"span_id"`
+	Score      float32   `json:"score"`
+	UserPrompt string    `json:"user_prompt,omitempty"`
+	Snippet    string    `json:"snippet,omitempty"`
+	Model      string    `json:"model,omitempty"`
+	StartedAt  time.Time `json:"started_at"`
+}
+
+type mcpSearchOutput struct {
+	Query   string            `json:"query"`
+	Results []mcpSearchResult `json:"results"`
+	Count   int               `json:"count"`
 }
 
 // ErrorResponse is the error body every non-200 response carries — the same
@@ -96,6 +119,7 @@ func (s *server) routes() http.Handler {
 	// /api/search/spans here is /v1/cassettes/search/spans publicly.
 	prefix := "/api/" + s.name
 	mux.HandleFunc("GET "+prefix+"/spans", s.handleSearchSpans)
+	mux.HandleFunc("POST "+prefix+"/spans", s.handleMCPSearch)
 
 	return mux
 }
@@ -145,38 +169,103 @@ func (s *server) handleSearchSpans(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	topK := 5
-	if topKStr := r.URL.Query().Get("top_k"); topKStr != "" {
-		parsed, err := strconv.Atoi(topKStr)
-		if err != nil || parsed <= 0 || parsed > maxTopK {
-			writeJSON(w, http.StatusBadRequest, ErrorResponse{
-				Error: fmt.Sprintf("top_k must be a positive integer no greater than %d", maxTopK),
-			})
-			return
-		}
-		topK = parsed
-	}
-
-	embedding, err := s.embedder.Embed(r.Context(), query)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, ErrorResponse{
-			Error: "failed to embed query: " + err.Error(),
+	topK, err := parseTopK(r.URL.Query().Get("top_k"))
+	if err != nil || topK <= 0 {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error: fmt.Sprintf("top_k must be a positive integer no greater than %d", maxTopK),
 		})
 		return
 	}
 
-	hits, err := s.searcher.Search(r.Context(), embedding, topK)
+	output, err := s.searchSpans(r.Context(), query, topK)
 	if errors.Is(err, spanembed.ErrNotInitialized) {
-		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
-			Error: err.Error(),
-		})
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{Error: err.Error()})
 		return
 	}
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, ErrorResponse{
-			Error: err.Error(),
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, output)
+}
+
+// handleMCPSearch is the JSON-body POST facade required by x-tapes-mcp.
+func (s *server) handleMCPSearch(w http.ResponseWriter, r *http.Request) {
+	if s.searcher == nil || s.embedder == nil {
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{
+			Error: "span search is not configured: embedder and span embedding store are required",
 		})
 		return
+	}
+
+	var input mcpSearchRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid search arguments: " + err.Error()})
+		return
+	}
+	if input.Query == nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "query is required"})
+		return
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "body must contain one JSON object"})
+		return
+	}
+
+	topK, err := parseTopK(string(input.TopK))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error: fmt.Sprintf("top_k must be an integer no greater than %d", maxTopK),
+		})
+		return
+	}
+	if topK <= 0 {
+		topK = 5
+	}
+	output, err := s.searchSpans(r.Context(), *input.Query, topK)
+	if errors.Is(err, spanembed.ErrNotInitialized) {
+		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{Error: err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+		return
+	}
+	results := make([]mcpSearchResult, len(output.Results))
+	for i, result := range output.Results {
+		results[i] = mcpSearchResult{
+			SessionID: result.SessionID, TraceID: result.TraceID, SpanID: result.SpanID,
+			Score: result.Score, UserPrompt: result.UserPrompt, Snippet: result.Snippet,
+			Model: result.Model, StartedAt: result.StartedAt,
+		}
+	}
+	writeJSON(w, http.StatusOK, mcpSearchOutput{Query: output.Query, Results: results, Count: output.Count})
+}
+
+// parseTopK applies the default and shared work limit. Callers retain their
+// existing non-positive semantics: GET rejects them; legacy MCP defaults them.
+func parseTopK(raw string) (int, error) {
+	if raw == "" {
+		return 5, nil
+	}
+	topK, err := strconv.Atoi(raw)
+	if err != nil || topK > maxTopK {
+		return 0, errors.New("invalid top_k")
+	}
+	return topK, nil
+}
+
+func (s *server) searchSpans(ctx context.Context, query string, topK int) (SpanSearchOutput, error) {
+	embedding, err := s.embedder.Embed(ctx, query)
+	if err != nil {
+		return SpanSearchOutput{}, fmt.Errorf("failed to embed query: %w", err)
+	}
+	hits, err := s.searcher.Search(ctx, embedding, topK)
+	if err != nil {
+		return SpanSearchOutput{}, err
 	}
 
 	results := make([]SpanSearchResult, 0, len(hits))
@@ -192,12 +281,7 @@ func (s *server) handleSearchSpans(w http.ResponseWriter, r *http.Request) {
 			StartedAt:  h.StartedAt,
 		})
 	}
-
-	writeJSON(w, http.StatusOK, SpanSearchOutput{
-		Query:   query,
-		Results: results,
-		Count:   len(results),
-	})
+	return SpanSearchOutput{Query: query, Results: results, Count: len(results)}, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
