@@ -93,7 +93,7 @@ func (e *Embedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: sending request: %w", embeddings.ErrEmbedding, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)

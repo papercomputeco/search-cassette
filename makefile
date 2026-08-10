@@ -4,6 +4,10 @@ IMAGE ?= tapes/search-cassette:0.1.0
 # that requirement through pkg/merkle.
 export GOEXPERIMENT := jsonv2
 
+.PHONY: check
+check: ## Runs the Dagger checks
+	dagger check
+
 .PHONY: build
 build: ## Builds the cassette binary
 	go build -o build/search-cassette .
