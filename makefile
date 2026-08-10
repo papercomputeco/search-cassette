@@ -9,8 +9,12 @@ build: ## Builds the cassette binary
 	go build -o build/search-cassette .
 
 .PHONY: image
-image: ## Builds the cassette container image
-	docker build -t $(IMAGE) .
+image: ## Builds and loads the cassette container image via Dagger
+	dagger call build-image export-image --name=$(IMAGE)
+
+.PHONY: check-image
+check-image: ## Builds the cassette container image without loading it
+	dagger call build-image sync
 
 .PHONY: test
 test: ## Runs the test suites
