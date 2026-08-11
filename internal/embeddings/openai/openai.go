@@ -131,7 +131,7 @@ func (e *Embedder) Embed(ctx context.Context, text string) ([]float32, error) {
 		// transport failure is transient, so surface it as retryable.
 		return nil, &embeddings.APIError{Message: err.Error(), Transient: true}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
