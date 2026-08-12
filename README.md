@@ -58,9 +58,9 @@ Deliberate adaptations, all documented inline:
   layout-compatible and is re-embedded rather than reused.
 - The span projection relations the store reads are configurable
   (`CASSETTE_SPANS_TABLE`, `CASSETTE_SPAN_TURNS_TABLE`), defaulting to the
-  current physical family (`spans_20260615`, `span_turns_20260615`). The
-  manifest declares the `spans`/`span_turns` contract views; point the
-  config at `tapes_v1.*` when those views land.
+  `tapes_v1.spans` / `tapes_v1.span_turns` contract views the manifest
+  declares. The views hold their names across tapes' projection-generation
+  rotations; never point the config at a date-versioned physical table.
 - Search and embedding share one process here because both *are* the search
   feature; tapes' derivation stays its own failure domain either way.
 - Configuration is environment-only, per the cassette convention — the
@@ -85,8 +85,8 @@ required.
 | `CASSETTE_EMBED_BATCH_SIZE` | `100` | Candidate page size |
 | `CASSETTE_EMBED_MAX_TEXT_BYTES` | `1048576` | Per-span rendered-text cap |
 | `CASSETTE_DB_SCHEMA` | `search` | Cassette-owned schema for the embedding tables |
-| `CASSETTE_SPANS_TABLE` | `spans_20260615` | Span projection relation |
-| `CASSETTE_SPAN_TURNS_TABLE` | `span_turns_20260615` | Span-turn projection relation |
+| `CASSETTE_SPANS_TABLE` | `tapes_v1.spans` | Span projection relation |
+| `CASSETTE_SPAN_TURNS_TABLE` | `tapes_v1.span_turns` | Span-turn projection relation |
 | `CASSETTE_WAIT_FOR_DB` | `false` | Retry an unreachable Postgres at startup |
 
 Provider defaults mirror tapes: Ollama is

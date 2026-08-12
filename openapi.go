@@ -188,13 +188,13 @@ func manifest(name string) map[string]any {
 			{
 				"key":         "spans_table",
 				"type":        "string",
-				"default":     "spans_20260615",
+				"default":     "tapes_v1.spans",
 				"description": "Tapes span projection relation to read candidates from; may be schema-qualified.",
 			},
 			{
 				"key":         "span_turns_table",
 				"type":        "string",
-				"default":     "span_turns_20260615",
+				"default":     "tapes_v1.span_turns",
 				"description": "Tapes span-turn projection relation to read turn context from; may be schema-qualified.",
 			},
 			{

@@ -39,9 +39,8 @@ port = 9998
 # `core` is a major contract version, not a release. `views` are the contract
 # views this cassette wants SELECT on: the span projection it embeds and the
 # span-turn rollup it joins for turn context. The declaration derives the
-# grant plan (tapes_v1.spans, tapes_v1.span_turns); until those contract
-# views exist, the deployment grants the equivalent physical tables and the
-# cassette's spans_table/span_turns_table config points at them.
+# grant plan (tapes_v1.spans, tapes_v1.span_turns), which core's migrations
+# publish; the deployment grants those views and nothing else.
 [depends]
 core = "v1"
 views = ["spans", "span_turns"]
@@ -128,13 +127,13 @@ description = "Cassette-owned schema the embedding tables live in."
 [[config]]
 key = "spans_table"
 type = "string"
-default = "spans_20260615"
+default = "tapes_v1.spans"
 description = "Tapes span projection relation to read candidates from; may be schema-qualified."
 
 [[config]]
 key = "span_turns_table"
 type = "string"
-default = "span_turns_20260615"
+default = "tapes_v1.span_turns"
 description = "Tapes span-turn projection relation to read turn context from; may be schema-qualified."
 
 [[config]]
