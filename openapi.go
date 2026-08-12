@@ -111,9 +111,9 @@ func manifest(name string) map[string]any {
 			"version":      cassetteVersion,
 			"display_name": "Span Search",
 			"description":  "Semantic span search over the tapes read model, extracted from tapes core.",
-			"license":      "Apache-2.0",
+			"license":      "MIT OR Apache-2.0",
 			"homepage":     "https://github.com/papercomputeco/search-cassette",
-			"image":        "tapes/search-cassette:" + cassetteVersion,
+			"image":        "public.ecr.aws/g4e5l3z3/papercomputeco/search-cassette:v" + cassetteVersion,
 			"port":         9998,
 		},
 		"depends": map[string]any{
