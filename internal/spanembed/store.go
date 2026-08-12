@@ -32,12 +32,13 @@ const (
 	maxVectorDimensions = 16000
 
 	// DefaultSpansTable and DefaultSpanTurnsTable are the tapes span
-	// projection tables candidate selection and search join against.
-	// They default to the current physical table family; when the
-	// tapes_v1 contract views land, point the store at them instead
-	// (e.g. "tapes_v1.spans") without a rebuild.
-	DefaultSpansTable     = "spans_20260615"
-	DefaultSpanTurnsTable = "span_turns_20260615"
+	// projection relations candidate selection and search join against:
+	// the tapes_v1 contract views, whose names hold stable across
+	// projection-generation rotations. The config exists for deployments
+	// that must point at something else (a fork, a test fixture), not
+	// because the defaults are expected to move.
+	DefaultSpansTable     = "tapes_v1.spans"
+	DefaultSpanTurnsTable = "tapes_v1.span_turns"
 )
 
 // ErrNotInitialized is returned by reads when the embedding table does
@@ -130,7 +131,7 @@ func qualified(schema, table string) pgx.Identifier {
 }
 
 // relationIdentifier parses an optionally schema-qualified relation name
-// ("spans_20260615" or "tapes_v1.spans") into an identifier, falling back to
+// ("spans" or "tapes_v1.spans") into an identifier, falling back to
 // fallback when name is empty.
 func relationIdentifier(name, fallback string) pgx.Identifier {
 	if name == "" {

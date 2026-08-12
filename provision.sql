@@ -13,8 +13,22 @@
 --   schema = name                ->  search
 --
 -- Postgres runs this exactly once, when the data directory is first
--- initialized. A stale volume will skip it: `docker compose down -v` to
--- reset.
+-- initialized. A stale volume skips it, and the only thing that re-runs it
+-- is destroying the volume — see the upgrade note below before reaching
+-- for `docker compose down -v`.
+--
+-- UPGRADING AN EXISTING VOLUME: a volume provisioned before the tapes_v1
+-- contract views carries public-schema-only privileges, and this script
+-- will not run again to widen them — the cassette's reads fail with
+-- permission denied. Apply the one-time grant (after tapes has migrated,
+-- so the views exist); it is idempotent and loses nothing:
+--
+--   GRANT USAGE ON SCHEMA tapes_v1 TO "cassette_search";
+--   GRANT SELECT ON tapes_v1.spans, tapes_v1.span_turns TO "cassette_search";
+--
+-- `docker compose down -v` also "fixes" it, by deleting the database —
+-- raw turns, sessions, and embeddings included. That is for throwaway
+-- instances only, never an upgrade path.
 
 -- The embedding tables need pgvector. Extension creation is a provisioning
 -- concern: the cassette's runtime credential commonly cannot create
@@ -29,10 +43,14 @@ CREATE ROLE "cassette_search" LOGIN PASSWORD 'cassette';
 GRANT CREATE ON DATABASE tapes TO "cassette_search";
 
 -- The manifest's depends.views declares SELECT on the tapes_v1 contract
--- views (tapes_v1.spans, tapes_v1.span_turns). Those views do not exist yet,
--- so this deployment grants the equivalent physical projection tables
--- instead: default privileges cover the tables tapes' migrations will create
--- after this script runs. Tighten to the two contract views once they land.
-GRANT USAGE ON SCHEMA public TO "cassette_search";
-ALTER DEFAULT PRIVILEGES FOR ROLE tapes IN SCHEMA public
-	GRANT SELECT ON TABLES TO "cassette_search";
+-- views (tapes_v1.spans, tapes_v1.span_turns). Tapes' migrations create the
+-- schema and the views AFTER this init script runs, so neither can be
+-- GRANTed by name here. Default privileges bridge the gap: everything the
+-- tapes role later creates — the tapes_v1 schema (ON SCHEMAS covers USAGE)
+-- and the views in it (ON TABLES covers views) — arrives readable by the
+-- cassette. A production deployment (tko) instead grants USAGE on tapes_v1
+-- and SELECT on exactly the declared views once they exist; this
+-- example-deployment shortcut is wider than that, and the width is the
+-- price of a single-pass init script.
+ALTER DEFAULT PRIVILEGES FOR ROLE tapes GRANT USAGE ON SCHEMAS TO "cassette_search";
+ALTER DEFAULT PRIVILEGES FOR ROLE tapes GRANT SELECT ON TABLES TO "cassette_search";
