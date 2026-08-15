@@ -9,7 +9,7 @@ import (
 
 // cassetteVersion is the release identity published in both the manifest and
 // the OpenAPI info block.
-const cassetteVersion = "0.2.0"
+const cassetteVersion = "0.3.0"
 
 const searchToolDescription = "Semantic search over stored LLM sessions. Embeds the query and runs vector similarity over the span projection (main-conversation LLM spans, delta-only content). Each result is an individual span carrying its session, trace, and span identifiers plus a text snippet, so a client can jump straight to the matched turn."
 
