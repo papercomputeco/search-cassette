@@ -27,6 +27,26 @@ func (m *SearchCassette) image() *dagger.Dockerimage {
 	return dag.Dockerimage(dagger.DockerimageOpts{Source: m.Source})
 }
 
+// Test runs the test suites with a just-in-time Postgres service exposed
+// as TEST_POSTGRES_DSN, so the DB-backed specs run against the real
+// engine instead of skipping.
+//
+// +check
+func (m *SearchCassette) Test(ctx context.Context) (string, error) {
+	return dag.Container().
+		From("golang:1.26-bookworm").
+		WithEnvVariable("CGO_ENABLED", "0").
+		WithEnvVariable("GOEXPERIMENT", "jsonv2").
+		WithMountedCache("/go/pkg/mod", dag.CacheVolume("go-mod")).
+		WithMountedCache("/root/.cache/go-build", dag.CacheVolume("go-build")).
+		WithWorkdir("/src").
+		WithDirectory("/src", m.Source).
+		WithServiceBinding("postgres", postgresService()).
+		WithEnvVariable("TEST_POSTGRES_DSN", newPostgresDSN()).
+		WithExec([]string{"go", "test", "-count=1", "-v", "./..."}).
+		Stdout(ctx)
+}
+
 // BuildImage builds the local-platform search cassette image.
 func (m *SearchCassette) BuildImage() *dagger.Container {
 	return m.image().Build()
