@@ -221,6 +221,21 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 		return err
 	}
 
+	view := qualified(s.schema, baseName(s.table)+"_view").Sanitize()
+	createView := fmt.Sprintf(`
+		CREATE OR REPLACE VIEW %s AS
+		SELECT trace_id, span_id, chunk_idx, session_id, model, embedded_at, embedding
+		FROM %s
+	`, view, table)
+	if _, err := s.pool.Exec(ctx, createView); err != nil {
+		return fmt.Errorf("creating span embeddings read view: %w", err)
+	}
+	if _, err := s.pool.Exec(ctx, fmt.Sprintf(
+		`COMMENT ON VIEW %s IS 'Stable read contract for cassettes that consume span embeddings.'`, view,
+	)); err != nil {
+		return fmt.Errorf("commenting span embeddings read view: %w", err)
+	}
+
 	indexName := pgx.Identifier{baseName(s.table) + "_embedding_idx"}.Sanitize()
 	createIndex := fmt.Sprintf(`
 		CREATE INDEX IF NOT EXISTS %s

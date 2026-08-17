@@ -53,9 +53,12 @@ Deliberate adaptations, all documented inline:
 
 - The embedding tables live in the cassette-owned `search` schema
   (`search.span_embeddings`, `search.span_embeddings_failures`) per the
-  cassette contract, instead of the default search path. They are created
-  org-free; a pre-cassette tapes `span_embeddings` table is not
-  layout-compatible and is re-embedded rather than reused.
+  cassette contract, instead of the default search path. The cassette also
+  publishes `search.span_embeddings_view` as the stable read surface for
+  dependent cassettes, exposing span identity, session, model, timestamp, and
+  embedding. The tables are created org-free; a pre-cassette tapes
+  `span_embeddings` table is not layout-compatible and is re-embedded rather
+  than reused.
 - The span projection relations the store reads are configurable
   (`CASSETTE_SPANS_TABLE`, `CASSETTE_SPAN_TURNS_TABLE`), defaulting to the
   current physical family (`spans_20260615`, `span_turns_20260615`). The
