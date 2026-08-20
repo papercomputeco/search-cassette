@@ -26,12 +26,15 @@ kind = "cassette/v1alpha1"
 # ("cassette_search").
 [cassette]
 name = "search"
-version = "0.2.2"
+# Placeholder, not a maintained number: the release stamps the tag it builds
+# into the image, and a source tree is not a release. The published identity
+# of any given image is the tag it was released under. See openapi.go.
+version = "0.0.0"
 display_name = "Span Search"
 description = "Semantic span search over the tapes read model, extracted from tapes core."
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/papercomputeco/search-cassette"
-image = "public.ecr.aws/g4e5l3z3/papercomputeco/search-cassette:v0.2.2"
+image = "public.ecr.aws/g4e5l3z3/papercomputeco/search-cassette:v0.0.0"
 port = 9998
 
 # What this cassette needs from tapes.

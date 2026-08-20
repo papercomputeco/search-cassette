@@ -17,10 +17,18 @@ RUN go mod download
 COPY *.go ./
 COPY internal/ internal/
 
+# The release identity this image reports, stamped into the manifest it
+# serves. Left unset the binary keeps openapi.go's placeholder, which is what
+# a build from a source tree should say: it is not a release. The release
+# pipeline passes the tag it is publishing.
+ARG CASSETTE_VERSION=0.0.0
+
 # CGO off gives a static binary, which is what lets the final stage be
 # distroless. jsonv2 matches the tapes module's build configuration.
 ENV CGO_ENABLED=0 GOEXPERIMENT=jsonv2
-RUN go build -trimpath -ldflags="-s -w" -o /out/search-cassette .
+RUN go build -trimpath \
+      -ldflags="-s -w -X github.com/papercomputeco/search-cassette/internal/release.Version=${CASSETTE_VERSION}" \
+      -o /out/search-cassette .
 
 FROM gcr.io/distroless/static-debian12:nonroot
 

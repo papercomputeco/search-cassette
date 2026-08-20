@@ -5,11 +5,9 @@ import (
 	"strings"
 
 	oas "github.com/papercomputeco/tapes/pkg/tapesoapi"
-)
 
-// cassetteVersion is the release identity published in both the manifest and
-// the OpenAPI info block.
-const cassetteVersion = "0.2.2"
+	"github.com/papercomputeco/search-cassette/internal/release"
+)
 
 const searchToolDescription = "Semantic search over stored LLM sessions. Embeds the query and runs vector similarity over the span projection (main-conversation LLM spans, delta-only content). Each result is an individual span carrying its session, trace, and span identifiers plus a text snippet, so a client can jump straight to the matched turn."
 
@@ -29,7 +27,7 @@ func openAPIDocument(name string) []byte {
 	parser := oas.NewParser(oas.WithInfo(oas.Info{
 		Title:       "Search Cassette",
 		Description: "Semantic span search over the tapes read model, extracted from tapes core.",
-		Version:     cassetteVersion,
+		Version:     release.Version,
 	}))
 
 	provenance := oas.Provenance{Kind: oas.KindManual, Name: "search cassette"}
@@ -108,12 +106,12 @@ func manifest(name string) map[string]any {
 		"kind": "cassette/v1alpha1",
 		"cassette": map[string]any{
 			"name":         name,
-			"version":      cassetteVersion,
+			"version":      release.Version,
 			"display_name": "Span Search",
 			"description":  "Semantic span search over the tapes read model, extracted from tapes core.",
 			"license":      "MIT OR Apache-2.0",
 			"homepage":     "https://github.com/papercomputeco/search-cassette",
-			"image":        "public.ecr.aws/g4e5l3z3/papercomputeco/search-cassette:v" + cassetteVersion,
+			"image":        "public.ecr.aws/g4e5l3z3/papercomputeco/search-cassette:v" + release.Version,
 			"port":         9998,
 		},
 		"depends": map[string]any{
