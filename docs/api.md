@@ -67,7 +67,7 @@ Both routes share them.
 | `200` | Search ran. Zero results is a `200` with `count: 0`. |
 | `400` | Missing `query`, or a `top_k` outside 1–100. |
 | `500` | Search execution failed. |
-| `503` | Search is not configured, or no embed pass has completed yet. |
+| `503` | Search is not configured, or the embedding table is missing. |
 
 `503` is the one worth recognizing, and it carries two distinct causes:
 

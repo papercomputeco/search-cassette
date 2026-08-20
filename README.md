@@ -25,7 +25,8 @@ curl localhost:8081/v1/cassettes
 curl "localhost:8081/v1/cassettes/search/spans?query=retry+backoff&top_k=3"
 ```
 
-A `503` is expected until the first embed pass completes.
+Until the first embed pass finishes there is nothing to match, so this answers
+`200` with `count: 0` rather than an error.
 
 Or against an existing tapes database:
 

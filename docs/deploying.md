@@ -141,5 +141,7 @@ curl localhost:8081/v1/cassettes
 curl "localhost:8081/v1/cassettes/search/spans?query=retry+backoff&top_k=3"
 ```
 
-A `503` here is expected until the first embed pass completes. See
-[Embedding](./embedding.md).
+Until the first embed pass finishes there is nothing to match, so this answers
+`200` with `count: 0` rather than an error — the table itself is created at
+startup. A `503` here means search is not configured or its table is missing; see
+[Embedding](./embedding.md) for when results begin appearing.
