@@ -67,16 +67,19 @@ Both routes share them.
 | `200` | Search ran. Zero results is a `200` with `count: 0`. |
 | `400` | Missing `query`, or a `top_k` outside 1–100. |
 | `500` | Search execution failed. |
-| `503` | Search is not configured, or the embedding table is missing. |
+| `503` | Search is not configured, or one of the relations it reads is missing. |
 
 `503` is the one worth recognizing, and it carries two distinct causes:
 
 - **Not configured** — the process has no embedder or no embedding store. Check
   `TAPES_DATABASE_URL` and the provider settings in [Deploying](./deploying.md).
-- **Not initialized** — the embedding table is missing. Startup creates it before
-  the server begins serving, so this does not clear on its own: something removed
-  the schema or made it inaccessible. Check the database state and restart once
-  it is corrected.
+- **A relation is missing.** A search reads three: the cassette's own embedding
+  table, and the two contract views it joins for span and turn context
+  (`tapes_v1.spans`, `tapes_v1.span_turns`, or whatever the table settings point
+  at). Postgres reports `undefined_table` for any of them and all three surface
+  as this one `503`, so check the contract views as well as the cassette's schema
+  — the embedding table is created at startup, which makes the views the more
+  likely culprit. Neither clears on its own.
 
 The first is a configuration signal and the second is a database one; neither is
 a `500` because the process itself is healthy. A query that simply matches nothing
