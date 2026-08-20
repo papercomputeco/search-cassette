@@ -45,8 +45,10 @@ and fetches, not part of the proxied API.
 
 Candidates are the spans of the tapes read model, rendered delta-only: a span's
 text is what that turn *added*, not the whole conversation replayed. Rendering is
-content-hashed, so a pass re-embeds only what changed, and identical content is
-never embedded twice.
+content-hashed per span, so a pass re-embeds a span only when that span's own
+rendered content has changed. The hash is compared within a span's identity, not
+across the corpus — two distinct spans with identical text are embedded
+separately.
 
 The projection relations it reads are the `tapes_v1` contract views, whose names
 hold stable across tapes' projection-generation rotations. See

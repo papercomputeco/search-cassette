@@ -73,10 +73,12 @@ Both routes share them.
 
 - **Not configured** — the process has no embedder or no embedding store. Check
   `TAPES_DATABASE_URL` and the provider settings in [Deploying](./deploying.md).
-- **Not initialized** — the embedding table does not exist yet, because no embed
-  pass has completed against this store. The response says so. This resolves on
-  its own once the first pass finishes; see [Embedding](./embedding.md).
+- **Not initialized** — the embedding table is missing. Startup creates it before
+  the server begins serving, so this does not clear on its own: something removed
+  the schema or made it inaccessible. Check the database state and restart once
+  it is corrected.
 
-Both are readiness signals rather than failures, which is why they are `503` and
-not `500`. Once a pass has run, a query matching nothing is an ordinary `200` with
-`count: 0`.
+The first is a configuration signal and the second is a database one; neither is
+a `500` because the process itself is healthy. A query that simply matches nothing
+is an ordinary `200` with `count: 0`, including before the first embed pass has
+put anything in the table.

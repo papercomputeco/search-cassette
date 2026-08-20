@@ -17,8 +17,10 @@ span's text, and embeds what has changed.
 - **Delta-only rendering.** A span's text is what that turn added, not the whole
   conversation replayed. This is the same normalization tapes derives with, so the
   two cannot drift.
-- **Content hashing.** Rendered text is hashed, and a span whose hash is unchanged
-  is skipped. Re-running a pass over unchanged data embeds nothing.
+- **Content hashing.** Rendered text is hashed per span, and a span whose hash is
+  unchanged since its last embedding is skipped. Re-running a pass over unchanged
+  data embeds nothing. The comparison is within a span's own identity — identical
+  text in two different spans is embedded twice.
 - **Chunking.** A span too large for one embedding is split into chunks.
 - **Orphan pruning.** Embeddings whose spans no longer exist are removed, so
   re-derivation on the tapes side does not leave the index carrying rows that can
@@ -48,9 +50,12 @@ The loop backs off and the next pass picks the span up again.
 | `CASSETTE_EMBED_BATCH_SIZE` | `100` | Candidate page size. Bounds peak memory per pass. |
 | `CASSETTE_EMBED_MAX_TEXT_BYTES` | `1048576` | Per-span rendered-text cap. Negative disables. |
 
-The interval is a floor on freshness, not a guarantee: a pass that takes longer
-than the interval simply runs continuously. Lower the batch size if peak memory
-matters more than throughput.
+The interval is measured from the **end** of one pass to the start of the next, so
+a pass's own duration adds to the gap between starts. An overlong pass is followed
+by another full interval rather than running back to back — worth knowing when
+sizing the interval against how fresh search results need to be.
+
+Lower the batch size if peak memory matters more than throughput.
 
 ## Metrics
 

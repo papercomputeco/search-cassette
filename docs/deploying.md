@@ -9,7 +9,7 @@ Tapes does not start cassettes. A deployment starts the process, supplies its
 configuration and credentials, and tells tapes where to find its OpenAPI document.
 
 ```text
-public.ecr.aws/g4e5l3z3/papercomputeco/search-cassette:<version>
+public.ecr.aws/g4e5l3z3/papercomputeco/search-cassette:v<version>
 ```
 
 Tags are the published release versions — see
@@ -41,7 +41,7 @@ Everything arrives through the environment. Only the database URL is required.
 | `CASSETTE_EMBED_INTERVAL` | `1m` | Embed pass cadence. |
 | `CASSETTE_EMBED_BATCH_SIZE` | `100` | Candidate page size. |
 | `CASSETTE_EMBED_MAX_TEXT_BYTES` | `1048576` | Per-span rendered-text cap. |
-| `CASSETTE_DB_SCHEMA` | `search` | Cassette-owned schema for the embedding tables. |
+| `CASSETTE_DB_SCHEMA` | the cassette name (`search` unless changed) | Cassette-owned schema for the embedding tables. |
 | `CASSETTE_SPANS_TABLE` | `tapes_v1.spans` | Span projection relation. |
 | `CASSETTE_SPAN_TURNS_TABLE` | `tapes_v1.span_turns` | Span-turn projection relation. |
 | `CASSETTE_WAIT_FOR_DB` | `false` | Retry an unreachable Postgres at startup with backoff instead of exiting. |
