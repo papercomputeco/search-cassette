@@ -1,4 +1,5 @@
 IMAGE ?= tapes/search-cassette:0.1.0
+CONTAINER_TOOL ?= docker
 
 # The tapes module builds with the jsonv2 experiment; this module inherits
 # that requirement through pkg/merkle.
@@ -9,16 +10,16 @@ check: ## Runs the Dagger checks
 	dagger check
 
 .PHONY: build
-build: ## Builds the cassette binary
+build: image ## Builds the local development image directly from Dockerfile
+
+.PHONY: build-local
+build-local: ## Builds the cassette binary for the host
+	mkdir -p build
 	go build -o build/search-cassette .
 
 .PHONY: image
-image: ## Builds and loads the cassette container image via Dagger
-	dagger call build-image export-image --name=$(IMAGE)
-
-.PHONY: check-image
-check-image: ## Builds the cassette container image without loading it
-	dagger call build-image sync
+image: ## Builds the cassette container image (override with IMAGE=name:tag)
+	$(CONTAINER_TOOL) build -t $(IMAGE) -f Dockerfile .
 
 .PHONY: test
 test: ## Runs the test suites
