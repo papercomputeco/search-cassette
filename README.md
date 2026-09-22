@@ -31,6 +31,7 @@ Until the first embed pass finishes there is nothing to match, so this answers
 Or against an existing tapes database:
 
 ```bash
+make build-local
 TAPES_DATABASE_URL=postgres://cassette_search:...@host:5432/tapes \
   ./build/search-cassette
 ```
@@ -48,8 +49,9 @@ existing table.
 
 ```bash
 make help
-make build   # GOEXPERIMENT=jsonv2, inherited from the tapes module
-make test    # Ginkgo/Gomega suites, including the manifest digest parity test
+make build         # local tapes/search-cassette:0.1.0 container image
+make build-local   # host binary with GOEXPERIMENT=jsonv2
+make test          # Ginkgo/Gomega suites, including manifest digest parity
 ```
 
 ## License
