@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -40,6 +41,23 @@ type SpanSearchResult struct {
 	Snippet   string    `json:"snippet,omitempty"`
 	Model     string    `json:"model,omitempty"`
 	StartedAt time.Time `json:"started_at"`
+	sessionContext
+}
+
+// sessionContext is the session a hit belongs to: who ran it, where, with
+// which harness, and whether it is still running. Both result shapes embed it
+// so GET and the MCP tool can never disagree about it.
+type sessionContext struct {
+	// AuthSubject is the session's opaque auth subject id.
+	AuthSubject string `json:"auth_subject,omitempty"`
+	Cwd         string `json:"cwd,omitempty"`
+	HarnessID   string `json:"harness_id,omitempty"`
+	// DisplayTitle is the session's display name, else its derived title.
+	DisplayTitle string    `json:"display_title,omitempty"`
+	LastSeenAt   time.Time `json:"last_seen_at,omitzero"`
+	// Live is an unended session seen within the last five minutes. Always
+	// served, so false is explicit rather than a dropped key.
+	Live bool `json:"live"`
 }
 
 // SpanSearchOutput is the span search response.
@@ -50,8 +68,14 @@ type SpanSearchOutput struct {
 }
 
 type mcpSearchRequest struct {
-	Query *string         `json:"query"`
-	TopK  json.RawMessage `json:"top_k,omitempty"`
+	Query       *string         `json:"query"`
+	TopK        json.RawMessage `json:"top_k,omitempty"`
+	AuthSubject authSubjects    `json:"auth_subject,omitempty"`
+	Cwd         string          `json:"cwd,omitempty"`
+	Harness     string          `json:"harness,omitempty"`
+	Since       string          `json:"since,omitempty"`
+	Until       string          `json:"until,omitempty"`
+	Live        *bool           `json:"live,omitempty"`
 }
 
 type mcpSearchResult struct {
@@ -63,6 +87,7 @@ type mcpSearchResult struct {
 	Snippet    string    `json:"snippet,omitempty"`
 	Model      string    `json:"model,omitempty"`
 	StartedAt  time.Time `json:"started_at"`
+	sessionContext
 }
 
 type mcpSearchOutput struct {
@@ -80,7 +105,7 @@ type ErrorResponse struct {
 // SpanSearcher runs vector similarity over the embedded span projection.
 // *spanembed.Store implements it; tests substitute a fake.
 type SpanSearcher interface {
-	Search(ctx context.Context, embedding []float32, topK int) ([]spanembed.Hit, error)
+	Search(ctx context.Context, embedding []float32, topK int, filter spanembed.SearchFilter) ([]spanembed.Hit, error)
 }
 
 // server is the cassette's HTTP surface: the two root anchors core probes
@@ -177,7 +202,28 @@ func (s *server) handleSearchSpans(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	output, err := s.searchSpans(r.Context(), query, topK)
+	params := r.URL.Query()
+	filter, err := parseSearchFilter(searchFilterInput{
+		AuthSubjects: params["auth_subject"],
+		Cwd:          params.Get("cwd"),
+		Harness:      params.Get("harness"),
+		Since:        params.Get("since"),
+		Until:        params.Get("until"),
+	})
+	if err == nil && params.Get("live") != "" {
+		var live bool
+		if live, err = strconv.ParseBool(params.Get("live")); err != nil {
+			err = errors.New("live must be true or false")
+		} else {
+			filter.Live = &live
+		}
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+		return
+	}
+
+	output, err := s.searchSpans(r.Context(), query, topK, filter)
 	if errors.Is(err, spanembed.ErrNotInitialized) {
 		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{Error: err.Error()})
 		return
@@ -225,7 +271,19 @@ func (s *server) handleMCPSearch(w http.ResponseWriter, r *http.Request) {
 	if topK <= 0 {
 		topK = 5
 	}
-	output, err := s.searchSpans(r.Context(), *input.Query, topK)
+	filter, err := parseSearchFilter(searchFilterInput{
+		AuthSubjects: input.AuthSubject,
+		Cwd:          input.Cwd,
+		Harness:      input.Harness,
+		Since:        input.Since,
+		Until:        input.Until,
+	})
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+		return
+	}
+	filter.Live = input.Live
+	output, err := s.searchSpans(r.Context(), *input.Query, topK, filter)
 	if errors.Is(err, spanembed.ErrNotInitialized) {
 		writeJSON(w, http.StatusServiceUnavailable, ErrorResponse{Error: err.Error()})
 		return
@@ -240,6 +298,7 @@ func (s *server) handleMCPSearch(w http.ResponseWriter, r *http.Request) {
 			SessionID: result.SessionID, TraceID: result.TraceID, SpanID: result.SpanID,
 			Score: result.Score, UserPrompt: result.UserPrompt, Snippet: result.Snippet,
 			Model: result.Model, StartedAt: result.StartedAt,
+			sessionContext: result.sessionContext,
 		}
 	}
 	writeJSON(w, http.StatusOK, mcpSearchOutput{Query: output.Query, Results: results, Count: output.Count})
@@ -258,12 +317,77 @@ func parseTopK(raw string) (int, error) {
 	return topK, nil
 }
 
-func (s *server) searchSpans(ctx context.Context, query string, topK int) (SpanSearchOutput, error) {
+// searchFilterInput is the string form of the search filters, shared by the
+// GET query parameters and the MCP body. live is parsed by each caller, since
+// one carries it as a string and the other as a JSON boolean.
+type searchFilterInput struct {
+	AuthSubjects               []string
+	Cwd, Harness, Since, Until string
+}
+
+// authSubjects is the MCP body's auth_subject: one id as a string, or
+// several as an array of strings, matched as alternatives.
+type authSubjects []string
+
+// A JSON null, alone or in the array, is refused rather than decoded as an
+// empty id: empty ids are dropped before the query, so a null would silently
+// widen the search to every author.
+func (a *authSubjects) UnmarshalJSON(data []byte) error {
+	errShape := errors.New("auth_subject must be a string or an array of strings")
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return errShape
+	}
+	var one string
+	if err := json.Unmarshal(data, &one); err == nil {
+		*a = authSubjects{one}
+		return nil
+	}
+	var many []*string
+	if err := json.Unmarshal(data, &many); err != nil {
+		return errShape
+	}
+	ids := make(authSubjects, 0, len(many))
+	for _, id := range many {
+		if id == nil {
+			return errShape
+		}
+		ids = append(ids, *id)
+	}
+	*a = ids
+	return nil
+}
+
+// parseSearchFilter validates the filters. Timestamps are RFC3339, the same
+// format tapes' session list accepts for since/until.
+func parseSearchFilter(in searchFilterInput) (spanembed.SearchFilter, error) {
+	filter := spanembed.SearchFilter{
+		AuthSubjects: in.AuthSubjects,
+		CwdPrefix:    in.Cwd,
+		HarnessID:    in.Harness,
+	}
+	if in.Since != "" {
+		t, err := time.Parse(time.RFC3339, in.Since)
+		if err != nil {
+			return filter, errors.New("since must be an RFC3339 timestamp")
+		}
+		filter.Since = &t
+	}
+	if in.Until != "" {
+		t, err := time.Parse(time.RFC3339, in.Until)
+		if err != nil {
+			return filter, errors.New("until must be an RFC3339 timestamp")
+		}
+		filter.Until = &t
+	}
+	return filter, nil
+}
+
+func (s *server) searchSpans(ctx context.Context, query string, topK int, filter spanembed.SearchFilter) (SpanSearchOutput, error) {
 	embedding, err := s.embedder.Embed(ctx, query)
 	if err != nil {
 		return SpanSearchOutput{}, fmt.Errorf("failed to embed query: %w", err)
 	}
-	hits, err := s.searcher.Search(ctx, embedding, topK)
+	hits, err := s.searcher.Search(ctx, embedding, topK, filter)
 	if err != nil {
 		return SpanSearchOutput{}, err
 	}
@@ -279,6 +403,14 @@ func (s *server) searchSpans(ctx context.Context, query string, topK int) (SpanS
 			Snippet:    h.Snippet,
 			Model:      h.Model,
 			StartedAt:  h.StartedAt,
+			sessionContext: sessionContext{
+				AuthSubject:  h.AuthSubject,
+				Cwd:          h.Cwd,
+				HarnessID:    h.HarnessID,
+				DisplayTitle: h.DisplayTitle,
+				LastSeenAt:   h.LastSeenAt,
+				Live:         h.Live,
+			},
 		})
 	}
 	return SpanSearchOutput{Query: query, Results: results, Count: len(results)}, nil

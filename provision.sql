@@ -24,7 +24,12 @@
 -- so the views exist); it is idempotent and loses nothing:
 --
 --   GRANT USAGE ON SCHEMA tapes_v1 TO "cassette_search";
---   GRANT SELECT ON tapes_v1.spans, tapes_v1.span_turns TO "cassette_search";
+--   GRANT SELECT ON tapes_v1.spans, tapes_v1.span_turns, tapes_v1.sessions TO "cassette_search";
+--
+-- The same grant covers a volume provisioned before the cassette declared
+-- tapes_v1.sessions: default privileges below made the view readable when
+-- tapes created it, but a deployment that granted only spans and span_turns
+-- by name must add sessions before running this version.
 --
 -- `docker compose down -v` also "fixes" it, by deleting the database —
 -- raw turns, sessions, and embeddings included. That is for throwaway
@@ -43,7 +48,8 @@ CREATE ROLE "cassette_search" LOGIN PASSWORD 'cassette';
 GRANT CREATE ON DATABASE tapes TO "cassette_search";
 
 -- The manifest's depends.views declares SELECT on the tapes_v1 contract
--- views (tapes_v1.spans, tapes_v1.span_turns). Tapes' migrations create the
+-- views (tapes_v1.spans, tapes_v1.span_turns, tapes_v1.sessions). Tapes'
+-- migrations create the
 -- schema and the views AFTER this init script runs, so neither can be
 -- GRANTed by name here. Default privileges bridge the gap: everything the
 -- tapes role later creates — the tapes_v1 schema (ON SCHEMAS covers USAGE)

@@ -13,19 +13,22 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/gstruct"
 
 	"github.com/papercomputeco/search-cassette/internal/spanembed"
 )
 
 // fakeSpanSearcher implements SpanSearcher in memory.
 type fakeSpanSearcher struct {
-	hits     []spanembed.Hit
-	err      error
-	lastTopK int
+	hits       []spanembed.Hit
+	err        error
+	lastTopK   int
+	lastFilter spanembed.SearchFilter
 }
 
-func (f *fakeSpanSearcher) Search(_ context.Context, _ []float32, topK int) ([]spanembed.Hit, error) {
+func (f *fakeSpanSearcher) Search(_ context.Context, _ []float32, topK int, filter spanembed.SearchFilter) ([]spanembed.Hit, error) {
 	f.lastTopK = topK
+	f.lastFilter = filter
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -167,6 +170,108 @@ var _ = Describe("handleSearchSpans", func() {
 	It("accepts the MCP top_k maximum", func() {
 		Expect(post(`{"query":"x","top_k":100}`).Code).To(Equal(http.StatusOK))
 		Expect(searcher.lastTopK).To(Equal(maxTopK))
+	})
+
+	It("passes every GET filter through to the searcher", func() {
+		rec := get(handler, "/api/search/spans?query=x&auth_subject=user_01&auth_subject=local%3Aada&cwd=%2Fsrc%2Fapp"+
+			"&harness=claude&since=2026-06-01T00:00:00Z&until=2026-06-02T00:00:00Z&live=true")
+		Expect(rec.Code).To(Equal(http.StatusOK))
+
+		f := searcher.lastFilter
+		Expect(f.AuthSubjects).To(Equal([]string{"user_01", "local:ada"}))
+		Expect(f.CwdPrefix).To(Equal("/src/app"))
+		Expect(f.HarnessID).To(Equal("claude"))
+		Expect(f.Since).NotTo(BeNil())
+		Expect(*f.Since).To(BeTemporally("==", time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)))
+		Expect(f.Until).NotTo(BeNil())
+		Expect(*f.Until).To(BeTemporally("==", time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC)))
+		Expect(f.Live).To(gstruct.PointTo(BeTrue()))
+	})
+
+	It("searches unfiltered when no GET filter is given", func() {
+		Expect(get(handler, "/api/search/spans?query=x").Code).To(Equal(http.StatusOK))
+		Expect(searcher.lastFilter).To(Equal(spanembed.SearchFilter{}))
+	})
+
+	It("rejects malformed GET since, until, and live", func() {
+		Expect(get(handler, "/api/search/spans?query=x&since=yesterday").Code).To(Equal(http.StatusBadRequest))
+		Expect(get(handler, "/api/search/spans?query=x&until=2026-06-01").Code).To(Equal(http.StatusBadRequest))
+		Expect(get(handler, "/api/search/spans?query=x&live=maybe").Code).To(Equal(http.StatusBadRequest))
+	})
+
+	It("passes every MCP filter through to the searcher", func() {
+		rec := post(`{"query":"x","auth_subject":"user_01","cwd":"/src",` +
+			`"harness":"codex","since":"2026-06-01T00:00:00Z","until":"2026-06-02T00:00:00+02:00","live":false}`)
+		Expect(rec.Code).To(Equal(http.StatusOK))
+
+		f := searcher.lastFilter
+		Expect(f.AuthSubjects).To(Equal([]string{"user_01"}))
+		Expect(f.CwdPrefix).To(Equal("/src"))
+		Expect(f.HarnessID).To(Equal("codex"))
+		Expect(*f.Since).To(BeTemporally("==", time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)))
+		Expect(*f.Until).To(BeTemporally("==", time.Date(2026, 6, 1, 22, 0, 0, 0, time.UTC)))
+		Expect(f.Live).To(gstruct.PointTo(BeFalse()))
+	})
+
+	It("accepts several MCP auth subjects as an array", func() {
+		Expect(post(`{"query":"x","auth_subject":["user_01","local:ada"]}`).Code).To(Equal(http.StatusOK))
+		Expect(searcher.lastFilter.AuthSubjects).To(Equal([]string{"user_01", "local:ada"}))
+	})
+
+	It("rejects an MCP auth_subject that is neither a string nor strings", func() {
+		Expect(post(`{"query":"x","auth_subject":7}`).Code).To(Equal(http.StatusBadRequest))
+		Expect(post(`{"query":"x","auth_subject":[1,2]}`).Code).To(Equal(http.StatusBadRequest))
+		Expect(post(`{"query":"x","auth_subject":null}`).Code).To(Equal(http.StatusBadRequest))
+		Expect(post(`{"query":"x","auth_subject":[null]}`).Code).To(Equal(http.StatusBadRequest))
+		Expect(post(`{"query":"x","auth_subject":["user_01",null]}`).Code).To(Equal(http.StatusBadRequest))
+	})
+
+	It("no longer accepts a name-matching subject filter", func() {
+		Expect(post(`{"query":"x","subject":"ada"}`).Code).To(Equal(http.StatusBadRequest))
+	})
+
+	It("rejects malformed MCP since, until, and live", func() {
+		Expect(post(`{"query":"x","since":"yesterday"}`).Code).To(Equal(http.StatusBadRequest))
+		Expect(post(`{"query":"x","until":"2026-06-01"}`).Code).To(Equal(http.StatusBadRequest))
+		Expect(post(`{"query":"x","live":"true"}`).Code).To(Equal(http.StatusBadRequest))
+	})
+
+	It("serves each hit's session context on both surfaces", func() {
+		lastSeen := time.Date(2026, 6, 1, 12, 30, 0, 0, time.UTC)
+		searcher.hits = []spanembed.Hit{{
+			TraceID: "trc", SpanID: "spn", SessionID: "5b6f0f8e-2c3a-4ec0-9b6e-000000000001",
+			AuthSubject: "user_01",
+			Cwd:         "/src/app", HarnessID: "claude", DisplayTitle: "Fix the backoff",
+			LastSeenAt: lastSeen, Live: false,
+		}}
+
+		for _, rec := range []*httptest.ResponseRecorder{get(handler, "/api/search/spans?query=x"), post(`{"query":"x"}`)} {
+			Expect(rec.Code).To(Equal(http.StatusOK))
+			var out struct {
+				Results []map[string]any `json:"results"`
+			}
+			Expect(json.Unmarshal(rec.Body.Bytes(), &out)).To(Succeed())
+			Expect(out.Results).To(HaveLen(1))
+			hit := out.Results[0]
+			Expect(hit).To(HaveKeyWithValue("session_id", "5b6f0f8e-2c3a-4ec0-9b6e-000000000001"))
+			Expect(hit).To(HaveKeyWithValue("auth_subject", "user_01"))
+			Expect(hit).NotTo(HaveKey("auth_subject_name"))
+			Expect(hit).NotTo(HaveKey("auth_subject_email"))
+			Expect(hit).To(HaveKeyWithValue("cwd", "/src/app"))
+			Expect(hit).To(HaveKeyWithValue("harness_id", "claude"))
+			Expect(hit).To(HaveKeyWithValue("display_title", "Fix the backoff"))
+			Expect(hit).To(HaveKeyWithValue("last_seen_at", "2026-06-01T12:30:00Z"))
+			// live is served even when false.
+			Expect(hit).To(HaveKeyWithValue("live", false))
+		}
+	})
+
+	It("omits unknown session context rather than serving empty values", func() {
+		searcher.hits = []spanembed.Hit{{TraceID: "trc", SpanID: "spn"}}
+		body := get(handler, "/api/search/spans?query=x").Body.String()
+		Expect(body).NotTo(ContainSubstring("auth_subject"))
+		Expect(body).NotTo(ContainSubstring("last_seen_at"))
+		Expect(body).To(ContainSubstring(`"live":false`))
 	})
 
 	It("returns 500 on search failures", func() {

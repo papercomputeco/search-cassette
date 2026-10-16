@@ -9,7 +9,34 @@ import (
 	"github.com/papercomputeco/search-cassette/internal/release"
 )
 
-const searchToolDescription = "Semantic search over stored LLM sessions. Embeds the query and runs vector similarity over the span projection (main-conversation LLM spans, delta-only content). Each result is an individual span carrying its session, trace, and span identifiers plus a text snippet, so a client can jump straight to the matched turn."
+const searchToolDescription = "Semantic search over every stored LLM session, from every author, not only your own. " +
+	"Use it to find where something was discussed or decided when you do not know which session it was in: " +
+	"\"who looked at the retry backoff\", \"the turn where we chose pgvector\", \"my sessions in this repo last week\". " +
+	"It embeds the query and runs vector similarity over main-conversation LLM spans; each result is one span with its " +
+	"session, trace, and span identifiers, a text snippet, and the session's auth_subject, cwd, " +
+	"harness, title, last-seen time, and whether it is live, so a client can jump straight to the matched turn. " +
+	"Optional filters narrow it: auth_subject (exact id; pass several to match any of them), cwd (working-directory prefix), " +
+	"harness (harness id, e.g. claude or codex), " +
+	"since/until (RFC3339 bounds on the turn's start), and live (only running, or only finished, sessions). " +
+	"Filtered searches still return top_k hits when enough spans match."
+
+// Filter descriptions, shared by the GET parameters and the MCP body so the
+// two surfaces describe one filter set.
+const (
+	filterAuthSubject = "only sessions whose opaque auth subject id is exactly this value; repeat to match any of several ids"
+	filterCwd         = "only sessions whose working directory starts with this prefix"
+	filterHarness     = "only sessions from this harness id (e.g. claude, codex)"
+	filterSince       = "only spans whose turn started at or after this RFC3339 time"
+	filterUntil       = "only spans whose turn started before this RFC3339 time"
+	filterLive        = "true: only live sessions (not ended, seen in the last 5 minutes); false: only sessions that are not live"
+)
+
+// authSubjectSchema is the MCP body's auth_subject: one id, or several.
+func authSubjectSchema() *oas.Schema {
+	schema := oas.OneOf(oas.String(), oas.Array(oas.String()))
+	schema.Description = "only sessions whose opaque auth subject id is exactly this value, or any of these values"
+	return schema
+}
 
 // openAPIDocument renders this cassette's OpenAPI document.
 //
@@ -51,8 +78,21 @@ func openAPIDocument(name string) []byte {
 				oas.ParamDescription("Search query")).
 			QueryParam("top_k", oas.Integer(oas.Minimum(1), oas.Maximum(maxTopK), oas.Default(5)),
 				oas.ParamDescription("Maximum number of results to return")).
+			QueryParam("auth_subject", oas.Array(oas.String()),
+				oas.ParamStyle("form", true),
+				oas.ParamDescription(filterAuthSubject)).
+			QueryParam("cwd", oas.String(),
+				oas.ParamDescription(filterCwd)).
+			QueryParam("harness", oas.String(),
+				oas.ParamDescription(filterHarness)).
+			QueryParam("since", oas.String(oas.Format("date-time")),
+				oas.ParamDescription(filterSince)).
+			QueryParam("until", oas.String(oas.Format("date-time")),
+				oas.ParamDescription(filterUntil)).
+			QueryParam("live", oas.Boolean(),
+				oas.ParamDescription(filterLive)).
 			JSONResponse(200, "Search hits", parser.Schema(SpanSearchOutput{})).
-			JSONResponse(400, "Missing or invalid query parameters", parser.Schema(ErrorResponse{})).
+			JSONResponse(400, "Missing or invalid query parameters (query, top_k, since, until, live)", parser.Schema(ErrorResponse{})).
 			JSONResponse(500, "Search execution failed", parser.Schema(ErrorResponse{})).
 			JSONResponse(503, "Span search is not configured or not yet initialized", parser.Schema(ErrorResponse{})).
 			Build(),
@@ -74,8 +114,14 @@ func openAPIDocument(name string) []byte {
 				},
 			}).
 			JSONBody("Search arguments", oas.Object(map[string]*oas.Schema{
-				"query": oas.String(oas.Description("the search query text to find relevant spans")),
-				"top_k": oas.Integer(oas.Maximum(maxTopK), oas.Description("number of results to return (default: 5)")),
+				"query":        oas.String(oas.Description("the search query text to find relevant spans")),
+				"top_k":        oas.Integer(oas.Maximum(maxTopK), oas.Description("number of results to return (default: 5)")),
+				"auth_subject": authSubjectSchema(),
+				"cwd":          oas.String(oas.Description(filterCwd)),
+				"harness":      oas.String(oas.Description(filterHarness)),
+				"since":        oas.String(oas.Format("date-time"), oas.Description(filterSince)),
+				"until":        oas.String(oas.Format("date-time"), oas.Description(filterUntil)),
+				"live":         oas.Boolean(oas.Description(filterLive)),
 			}, oas.Required("query"), oas.NoAdditionalProperties())).
 			JSONResponse(200, "Search hits", parser.Schema(mcpSearchOutput{})).
 			JSONResponse(400, "Invalid search arguments", parser.Schema(ErrorResponse{})).
@@ -116,7 +162,7 @@ func manifest(name string) map[string]any {
 		},
 		"depends": map[string]any{
 			"core":  "v1",
-			"views": []string{"spans", "span_turns"},
+			"views": []string{"spans", "span_turns", "sessions"},
 		},
 		"api": map[string]any{
 			"health":      "/ping",
@@ -194,6 +240,19 @@ func manifest(name string) map[string]any {
 				"type":        "string",
 				"default":     "tapes_v1.span_turns",
 				"description": "Tapes span-turn projection relation to read turn context from; may be schema-qualified.",
+			},
+			{
+				"key":         "sessions_table",
+				"type":        "string",
+				"default":     "tapes_v1.sessions",
+				"description": "Tapes session relation to read hit ownership, workspace, and liveness from; may be schema-qualified.",
+			},
+			{
+				"key":         "search.max_scan_tuples",
+				"type":        "int",
+				"default":     40000,
+				"min":         1,
+				"description": "hnsw.max_scan_tuples for a search: how many index tuples a filtered search may visit while skipping rows its filters reject.",
 			},
 			{
 				"key":         "wait_for_db",

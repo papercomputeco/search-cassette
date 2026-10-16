@@ -50,6 +50,12 @@ type cassetteConfig struct {
 	// them (e.g. "tapes_v1.spans") without a rebuild.
 	SpansTable     string
 	SpanTurnsTable string
+	// SessionsTable names the tapes session relation search joins.
+	SessionsTable string
+
+	// SearchMaxScanTuples is hnsw.max_scan_tuples for a search; zero takes
+	// the store default.
+	SearchMaxScanTuples int
 
 	EmbeddingProvider   string
 	EmbeddingTarget     string
@@ -71,6 +77,7 @@ func loadConfig() (cassetteConfig, error) {
 
 		SpansTable:     strings.TrimSpace(os.Getenv("CASSETTE_SPANS_TABLE")),
 		SpanTurnsTable: strings.TrimSpace(os.Getenv("CASSETTE_SPAN_TURNS_TABLE")),
+		SessionsTable:  strings.TrimSpace(os.Getenv("CASSETTE_SESSIONS_TABLE")),
 
 		EmbeddingProvider: strings.ToLower(envOrDefault("CASSETTE_EMBEDDING_PROVIDER", defaultEmbeddingProvider)),
 		EmbeddingTarget:   strings.TrimSpace(os.Getenv("CASSETTE_EMBEDDING_TARGET")),
@@ -96,6 +103,12 @@ func loadConfig() (cassetteConfig, error) {
 	}
 	if cfg.EmbedMaxTextBytes, err = envInt("CASSETTE_EMBED_MAX_TEXT_BYTES", 0); err != nil {
 		return cfg, err
+	}
+	if cfg.SearchMaxScanTuples, err = envInt("CASSETTE_SEARCH_MAX_SCAN_TUPLES", 0); err != nil {
+		return cfg, err
+	}
+	if cfg.SearchMaxScanTuples < 0 {
+		return cfg, fmt.Errorf("CASSETTE_SEARCH_MAX_SCAN_TUPLES must be positive")
 	}
 	dims, err := envInt("CASSETTE_EMBEDDING_DIMENSIONS", 0)
 	if err != nil {

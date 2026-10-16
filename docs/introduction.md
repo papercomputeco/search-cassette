@@ -8,7 +8,10 @@ sidebar:
 `search-cassette` answers semantic search over tapes sessions. You give it query
 text; it embeds the query and runs vector similarity over embedded spans, returning
 individual main-conversation LLM spans with their session, trace and span
-identifiers, so a client can jump straight to the matched turn.
+identifiers, so a client can jump straight to the matched turn. Each hit also
+carries its session's auth subject id, where it ran, and whether it is still
+live, and the same fields filter the search: by auth subject, working
+directory, harness, time window, or liveness.
 
 It is a [cassette](https://tapes.dev/docs/cassettes/) — an independently deployed
 HTTP service that tapes discovers from its OpenAPI document and reverse-proxies
