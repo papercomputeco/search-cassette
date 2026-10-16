@@ -45,6 +45,8 @@ Everything arrives through the environment. Only the database URL is required.
 | `CASSETTE_DB_SCHEMA` | the cassette name (`search` unless changed) | Cassette-owned schema for the embedding tables. |
 | `CASSETTE_SPANS_TABLE` | `tapes_v1.spans` | Span projection relation. |
 | `CASSETTE_SPAN_TURNS_TABLE` | `tapes_v1.span_turns` | Span-turn projection relation. |
+| `CASSETTE_SESSIONS_TABLE` | `tapes_v1.sessions` | Session relation joined for each hit's owner, workspace, and liveness. |
+| `CASSETTE_SEARCH_MAX_SCAN_TUPLES` | `40000` | `hnsw.max_scan_tuples` for a search: how far a filtered search walks the index past rejected rows. |
 | `CASSETTE_WAIT_FOR_DB` | `false` | Retry an unreachable Postgres at startup with backoff instead of exiting. |
 
 These names are mechanical: each is the manifest's config key under the standard
@@ -74,7 +76,7 @@ The manifest declares both halves of what this cassette needs:
 ```toml
 [depends]
 core = "v1"
-views = ["spans", "span_turns"]
+views = ["spans", "span_turns", "sessions"]
 
 [[tables]]
 name = "span_embeddings"
@@ -100,12 +102,16 @@ GRANT CREATE ON DATABASE tapes TO "cassette_search";
 
 -- Read access to exactly the declared contract views.
 GRANT USAGE ON SCHEMA tapes_v1 TO "cassette_search";
-GRANT SELECT ON tapes_v1.spans, tapes_v1.span_turns TO "cassette_search";
+GRANT SELECT ON tapes_v1.spans, tapes_v1.span_turns, tapes_v1.sessions TO "cassette_search";
 ```
+
+Grant `tapes_v1.sessions` before rolling out a cassette version that declares it:
+without the grant every search fails with a `500` naming the missing privilege.
 
 **pgvector is a provisioning concern.** A runtime credential commonly cannot create
 extensions in managed Postgres, so the cassette checks for it and fails fast rather
-than trying.
+than trying. Filtered search uses pgvector's iterative index scan
+(`hnsw.iterative_scan`, `hnsw.max_scan_tuples`), which needs pgvector 0.8 or later.
 
 `provision.sql` in the repository is the example-deployment equivalent, and it takes
 a shortcut worth knowing about: Postgres runs init scripts once, before tapes has

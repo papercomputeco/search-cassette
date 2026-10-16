@@ -40,13 +40,15 @@ port = 9998
 # What this cassette needs from tapes.
 #
 # `core` is a major contract version, not a release. `views` are the contract
-# views this cassette wants SELECT on: the span projection it embeds and the
-# span-turn rollup it joins for turn context. The declaration derives the
-# grant plan (tapes_v1.spans, tapes_v1.span_turns), which core's migrations
-# publish; the deployment grants those views and nothing else.
+# views this cassette wants SELECT on: the span projection it embeds, the
+# span-turn rollup it joins for turn context, and the sessions it joins for
+# each hit's owner, workspace, and liveness (and filters on). The declaration
+# derives the grant plan (tapes_v1.spans, tapes_v1.span_turns,
+# tapes_v1.sessions), which core's migrations publish; the deployment grants
+# those views and nothing else.
 [depends]
 core = "v1"
-views = ["spans", "span_turns"]
+views = ["spans", "span_turns", "sessions"]
 
 # Where the things core needs live on this cassette's own listener.
 #
@@ -138,6 +140,19 @@ key = "span_turns_table"
 type = "string"
 default = "tapes_v1.span_turns"
 description = "Tapes span-turn projection relation to read turn context from; may be schema-qualified."
+
+[[config]]
+key = "sessions_table"
+type = "string"
+default = "tapes_v1.sessions"
+description = "Tapes session relation to read hit ownership, workspace, and liveness from; may be schema-qualified."
+
+[[config]]
+key = "search.max_scan_tuples"
+type = "int"
+default = 40000
+min = 1
+description = "hnsw.max_scan_tuples for a search: how many index tuples a filtered search may visit while skipping rows its filters reject."
 
 [[config]]
 key = "wait_for_db"

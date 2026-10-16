@@ -100,6 +100,37 @@ type Hit struct {
 	Snippet    string
 	Model      string
 	StartedAt  time.Time
+
+	// Session context, from the joined tapes session. Empty (and LastSeenAt
+	// zero) when the span's session is unknown to the session relation.
+	// AuthSubject is the session's opaque auth subject id.
+	AuthSubject string
+	Cwd         string
+	HarnessID   string
+	// DisplayTitle is the session's display name, else its derived title.
+	DisplayTitle string
+	LastSeenAt   time.Time
+	// Live reports an unended session seen within the last five minutes.
+	Live bool
+}
+
+// SearchFilter narrows a search to spans whose session and turn match. Every
+// field is optional; the zero value searches everything.
+type SearchFilter struct {
+	// AuthSubjects matches sessions whose opaque auth subject is exactly
+	// one of these ids. Empty values are ignored.
+	AuthSubjects []string
+	// CwdPrefix matches sessions whose working directory starts with it.
+	CwdPrefix string
+	// HarnessID matches the session's harness exactly.
+	HarnessID string
+	// Since and Until bound the span's turn start: since inclusive, until
+	// exclusive, the same window tapes' session list applies.
+	Since *time.Time
+	Until *time.Time
+	// Live, when set, keeps only live (true) or only not-live (false)
+	// sessions.
+	Live *bool
 }
 
 // Report summarizes one embed pass.

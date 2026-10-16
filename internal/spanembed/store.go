@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -39,6 +40,21 @@ const (
 	// because the defaults are expected to move.
 	DefaultSpansTable     = "tapes_v1.spans"
 	DefaultSpanTurnsTable = "tapes_v1.span_turns"
+
+	// DefaultSessionsTable is the tapes session relation search joins for
+	// ownership, workspace, and liveness — the tapes_v1 contract view.
+	DefaultSessionsTable = "tapes_v1.sessions"
+
+	// DefaultMaxScanTuples bounds how many HNSW tuples one filtered search
+	// may visit while iterating past rows its filters reject. pgvector's own
+	// default is 20000; a selective filter (one author among many) needs
+	// headroom past it, and the bound still caps the worst-case cost of a
+	// filter that matches almost nothing.
+	DefaultMaxScanTuples = 40000
+
+	// liveWindow mirrors tapes' sessionLiveWindow: a session is live when it
+	// has not ended and was seen within this window.
+	liveWindow = "5 minutes"
 )
 
 // ErrNotInitialized is returned by reads when the embedding table does
@@ -62,6 +78,16 @@ type StoreConfig struct {
 	// defaults.
 	SpansTable     string
 	SpanTurnsTable string
+
+	// SessionsTable names the tapes session relation search joins for the
+	// owner, workspace, harness, and liveness of each hit. Empty takes
+	// DefaultSessionsTable.
+	SessionsTable string
+
+	// MaxScanTuples is hnsw.max_scan_tuples for a search: how far an
+	// iterative index scan may walk past filtered-out rows before it gives
+	// up. Zero takes DefaultMaxScanTuples.
+	MaxScanTuples int
 
 	// Dimensions is the embedding dimensionality. The table's vector
 	// column is created with exactly this size and EnsureSchema
@@ -88,6 +114,8 @@ type Store struct {
 	failures  pgx.Identifier
 	spans     pgx.Identifier
 	spanTurns pgx.Identifier
+	sessions  pgx.Identifier
+	maxScan   int
 	dims      uint
 	logger    *slog.Logger
 }
@@ -109,6 +137,13 @@ func NewStore(pool *pgxpool.Pool, cfg StoreConfig, log *slog.Logger) (*Store, er
 	if table == "" {
 		table = DefaultTableName
 	}
+	if cfg.MaxScanTuples < 0 {
+		return nil, errors.New("span search max scan tuples cannot be negative")
+	}
+	maxScan := cfg.MaxScanTuples
+	if maxScan == 0 {
+		maxScan = DefaultMaxScanTuples
+	}
 	return &Store{
 		pool:      pool,
 		schema:    cfg.Schema,
@@ -116,6 +151,8 @@ func NewStore(pool *pgxpool.Pool, cfg StoreConfig, log *slog.Logger) (*Store, er
 		failures:  qualified(cfg.Schema, table+failuresTableSuffix),
 		spans:     relationIdentifier(cfg.SpansTable, DefaultSpansTable),
 		spanTurns: relationIdentifier(cfg.SpanTurnsTable, DefaultSpanTurnsTable),
+		sessions:  relationIdentifier(cfg.SessionsTable, DefaultSessionsTable),
+		maxScan:   maxScan,
 		dims:      cfg.Dimensions,
 		logger:    log,
 	}, nil
@@ -496,46 +533,100 @@ func (s *Store) PruneOrphans(ctx context.Context) (int64, error) {
 // spans to fill the result. Chunks per span are few, so a small factor suffices.
 const searchOverfetch = 4
 
-// Search returns the topK spans most similar to the query embedding, joined
-// with their trace context (turn prompt and span payloads for the snippet).
+// Search returns the topK spans most similar to the query embedding that
+// pass filter, joined with their trace context (turn prompt and span payloads
+// for the snippet) and their session (auth subject, workspace, harness,
+// liveness).
 // A span may have several chunk embeddings; results collapse to one hit per
 // span, scored by the span's best-matching chunk.
-func (s *Store) Search(ctx context.Context, embedding []float32, topK int) ([]Hit, error) {
+//
+// The filters sit inside the nearest-neighbour CTE, next to the ORDER BY on
+// distance, rather than on its output. Applied afterwards they would only
+// thin an already-truncated candidate list: a filter that rejects the
+// closest rows would return fewer than topK hits, or none. Inside, with
+// pgvector's iterative index scan enabled, the HNSW scan keeps walking past
+// rejected rows until it has enough survivors or reaches hnsw.max_scan_tuples.
+// relaxed_order lets the scan emit slightly out of order; the outer ORDER BY
+// on distance restores exact order among the rows it returns.
+//
+// session_id comes from the joined span, not the embedding row: the
+// embedding's copy is written only on (re-)embed and goes stale when a span
+// moves session without its content changing.
+func (s *Store) Search(ctx context.Context, embedding []float32, topK int, filter SearchFilter) ([]Hit, error) {
 	if topK <= 0 {
 		topK = 5
 	}
 
-	table := s.table.Sanitize()
+	args := pgx.NamedArgs{
+		"embedding": pgvectorgo.NewVector(embedding),
+		"fetch":     topK * searchOverfetch,
+		"topk":      topK,
+	}
+	where := filter.conditions(args)
+	whereClause := ""
+	if len(where) > 0 {
+		whereClause = "WHERE " + strings.Join(where, "\n\t\t\t  AND ")
+	}
+
+	live := `COALESCE(ss.ended_at IS NULL AND ss.last_seen_at > now() - interval '` + liveWindow + `', false)`
 	query := fmt.Sprintf(`
 		WITH nearest AS (
-			SELECT e.trace_id, e.span_id, e.session_id,
+			SELECT e.trace_id, e.span_id,
 			       e.embedding <=> @embedding AS dist
 			FROM %s e
+			JOIN %s s
+			  ON s.trace_id = e.trace_id AND s.span_id = e.span_id
+			JOIN %s t
+			  ON t.trace_id = e.trace_id
+			LEFT JOIN %s ss
+			  ON ss.id = s.session_id
+			%s
 			ORDER BY e.embedding <=> @embedding
 			LIMIT @fetch
 		),
 		best AS (
-			SELECT DISTINCT ON (trace_id, span_id) trace_id, span_id, session_id, dist
+			SELECT DISTINCT ON (trace_id, span_id) trace_id, span_id, dist
 			FROM nearest
 			ORDER BY trace_id, span_id, dist
 		)
-		SELECT b.trace_id, b.span_id, b.session_id,
+		SELECT b.trace_id, b.span_id, s.session_id,
 		       1 - b.dist AS score,
-		       t.user_prompt, s.model, s.started_at, s.input, s.output
+		       t.user_prompt, s.model, s.started_at, s.input, s.output,
+		       COALESCE(ss.auth_subject, ''),
+		       COALESCE(ss.cwd, ''),
+		       COALESCE(ss.harness_id, ''),
+		       COALESCE(NULLIF(ss.display_name, ''), ss.derived_title, ''),
+		       ss.last_seen_at,
+		       %s
 		FROM best b
-		JOIN `+s.spans.Sanitize()+` s
+		JOIN %s s
 		  ON s.trace_id = b.trace_id AND s.span_id = b.span_id
-		JOIN `+s.spanTurns.Sanitize()+` t
+		JOIN %s t
 		  ON t.trace_id = b.trace_id
+		LEFT JOIN %s ss
+		  ON ss.id = s.session_id
 		ORDER BY b.dist
 		LIMIT @topk
-	`, table)
+	`, s.table.Sanitize(), s.spans.Sanitize(), s.spanTurns.Sanitize(), s.sessions.Sanitize(), whereClause,
+		live, s.spans.Sanitize(), s.spanTurns.Sanitize(), s.sessions.Sanitize())
 
-	rows, err := s.pool.Query(ctx, query, pgx.NamedArgs{
-		"embedding": pgvectorgo.NewVector(embedding),
-		"fetch":     topK * searchOverfetch,
-		"topk":      topK,
-	})
+	// A read-only transaction scopes the scan settings to this one query:
+	// SET LOCAL (set_config(..., true)) reverts at transaction end, so a
+	// pooled connection never carries them into an unrelated statement.
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("begin span search: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
+		SELECT set_config('hnsw.iterative_scan', 'relaxed_order', true),
+		       set_config('hnsw.max_scan_tuples', $1, true)
+	`, strconv.Itoa(s.maxScan)); err != nil {
+		return nil, fmt.Errorf("configuring iterative index scan: %w", err)
+	}
+
+	rows, err := tx.Query(ctx, query, args)
 	if err != nil {
 		if isUndefinedTable(err) {
 			return nil, ErrNotInitialized
@@ -547,27 +638,87 @@ func (s *Store) Search(ctx context.Context, embedding []float32, topK int) ([]Hi
 	var hits []Hit
 	for rows.Next() {
 		var (
-			h         Hit
-			session   pgtype.UUID
-			startedAt pgtype.Timestamptz
-			inp, outp []byte
+			h          Hit
+			session    pgtype.UUID
+			startedAt  pgtype.Timestamptz
+			lastSeenAt pgtype.Timestamptz
+			inp, outp  []byte
 		)
-		if err := rows.Scan(&h.TraceID, &h.SpanID, &session, &h.Score, &h.UserPrompt, &h.Model, &startedAt, &inp, &outp); err != nil {
+		if err := rows.Scan(&h.TraceID, &h.SpanID, &session, &h.Score, &h.UserPrompt, &h.Model, &startedAt, &inp, &outp,
+			&h.AuthSubject, &h.Cwd, &h.HarnessID, &h.DisplayTitle,
+			&lastSeenAt, &h.Live); err != nil {
 			return nil, fmt.Errorf("scanning span search hit: %w", err)
 		}
 		if session.Valid {
 			h.SessionID = uuid.UUID(session.Bytes).String()
 		}
 		h.StartedAt = startedAt.Time
+		if lastSeenAt.Valid {
+			h.LastSeenAt = lastSeenAt.Time
+		}
 		h.Snippet = snippet(RenderSpanText(inp, outp))
 		hits = append(hits, h)
 	}
 	if err := rows.Err(); err != nil {
+		if isUndefinedTable(err) {
+			return nil, ErrNotInitialized
+		}
 		return nil, fmt.Errorf("iterating span search hits: %w", err)
 	}
 
 	s.logger.Debug("span embedding search", "hits", len(hits))
 	return hits, nil
+}
+
+// conditions renders the filter as SQL predicates over the nearest CTE's
+// aliases (s = span, t = span turn, ss = session), binding values into args.
+// Only set fields contribute, so an unfiltered search plans exactly as
+// before the filters existed.
+func (f SearchFilter) conditions(args pgx.NamedArgs) []string {
+	var where []string
+	if subjects := nonEmpty(f.AuthSubjects); len(subjects) > 0 {
+		// Exact match on the opaque id; several ids are OR'd.
+		args["auth_subjects"] = subjects
+		where = append(where, "ss.auth_subject = ANY(@auth_subjects::text[])")
+	}
+	if f.CwdPrefix != "" {
+		args["cwd"] = f.CwdPrefix
+		where = append(where, "starts_with(ss.cwd, @cwd)")
+	}
+	if f.HarnessID != "" {
+		args["harness"] = f.HarnessID
+		where = append(where, "ss.harness_id = @harness")
+	}
+	if f.Since != nil {
+		args["since"] = *f.Since
+		where = append(where, "t.started_at >= @since::timestamptz")
+	}
+	if f.Until != nil {
+		args["until"] = *f.Until
+		where = append(where, "t.started_at < @until::timestamptz")
+	}
+	if f.Live != nil {
+		live := `(ss.ended_at IS NULL AND ss.last_seen_at > now() - interval '` + liveWindow + `')`
+		if *f.Live {
+			where = append(where, live)
+		} else {
+			// IS NOT TRUE, not NOT: a span with no session row is not live.
+			where = append(where, live+" IS NOT TRUE")
+		}
+	}
+	return where
+}
+
+// nonEmpty drops empty values, so an empty repeated parameter filters
+// nothing rather than matching sessions with no auth subject.
+func nonEmpty(values []string) []string {
+	var out []string
+	for _, v := range values {
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // snippetRunes bounds the matched-span preview a search hit carries.

@@ -102,6 +102,8 @@ func run(logger *slog.Logger) error {
 		Dimensions:     cfg.EmbeddingDimensions,
 		SpansTable:     cfg.SpansTable,
 		SpanTurnsTable: cfg.SpanTurnsTable,
+		SessionsTable:  cfg.SessionsTable,
+		MaxScanTuples:  cfg.SearchMaxScanTuples,
 	}, logger)
 	if err != nil {
 		return fmt.Errorf("could not create span embedding store: %w", err)
