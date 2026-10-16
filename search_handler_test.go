@@ -221,6 +221,9 @@ var _ = Describe("handleSearchSpans", func() {
 	It("rejects an MCP auth_subject that is neither a string nor strings", func() {
 		Expect(post(`{"query":"x","auth_subject":7}`).Code).To(Equal(http.StatusBadRequest))
 		Expect(post(`{"query":"x","auth_subject":[1,2]}`).Code).To(Equal(http.StatusBadRequest))
+		Expect(post(`{"query":"x","auth_subject":null}`).Code).To(Equal(http.StatusBadRequest))
+		Expect(post(`{"query":"x","auth_subject":[null]}`).Code).To(Equal(http.StatusBadRequest))
+		Expect(post(`{"query":"x","auth_subject":["user_01",null]}`).Code).To(Equal(http.StatusBadRequest))
 	})
 
 	It("no longer accepts a name-matching subject filter", func() {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -328,17 +329,31 @@ type searchFilterInput struct {
 // several as an array of strings, matched as alternatives.
 type authSubjects []string
 
+// A JSON null, alone or in the array, is refused rather than decoded as an
+// empty id: empty ids are dropped before the query, so a null would silently
+// widen the search to every author.
 func (a *authSubjects) UnmarshalJSON(data []byte) error {
+	errShape := errors.New("auth_subject must be a string or an array of strings")
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return errShape
+	}
 	var one string
 	if err := json.Unmarshal(data, &one); err == nil {
 		*a = authSubjects{one}
 		return nil
 	}
-	var many []string
+	var many []*string
 	if err := json.Unmarshal(data, &many); err != nil {
-		return errors.New("auth_subject must be a string or an array of strings")
+		return errShape
 	}
-	*a = many
+	ids := make(authSubjects, 0, len(many))
+	for _, id := range many {
+		if id == nil {
+			return errShape
+		}
+		ids = append(ids, *id)
+	}
+	*a = ids
 	return nil
 }
 
