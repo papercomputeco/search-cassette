@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 
@@ -52,6 +53,19 @@ const (
 	// filter that matches almost nothing.
 	DefaultMaxScanTuples = 40000
 
+	// ExactSearchDisabled, as StoreConfig.ExactSearchRows, sends every
+	// search through the HNSW index regardless of how few spans its
+	// filters match.
+	ExactSearchDisabled = -1
+
+	// indexToExactRowCost is what one HNSW candidate costs a filtered
+	// search relative to one exactly ranked row. Measured cold against a
+	// production tenant: an index candidate (graph pages, heap tuple, the
+	// filter's key probes) took about 14ms and an exactly ranked row (its
+	// vector out of TOAST) about 3ms. Only the ratio matters; it sets where
+	// the two strategies cost the same. See exactSearchRows.
+	indexToExactRowCost = 14.0 / 3.0
+
 	// liveWindow mirrors tapes' sessionLiveWindow: a session is live when it
 	// has not ended and was seen within this window.
 	liveWindow = "5 minutes"
@@ -89,6 +103,12 @@ type StoreConfig struct {
 	// up. Zero takes DefaultMaxScanTuples.
 	MaxScanTuples int
 
+	// ExactSearchRows is the most embedding rows a filtered search ranks
+	// exactly, by distance over every row its filters match, instead of
+	// walking the HNSW index. Zero derives it from the table's size (see
+	// exactSearchRows); ExactSearchDisabled always walks the index.
+	ExactSearchRows int
+
 	// Dimensions is the embedding dimensionality. The table's vector
 	// column is created with exactly this size and EnsureSchema
 	// fail-fasts when an existing table disagrees — model and dims are
@@ -116,6 +136,7 @@ type Store struct {
 	spanTurns pgx.Identifier
 	sessions  pgx.Identifier
 	maxScan   int
+	exactRows int
 	dims      uint
 	logger    *slog.Logger
 }
@@ -144,6 +165,9 @@ func NewStore(pool *pgxpool.Pool, cfg StoreConfig, log *slog.Logger) (*Store, er
 	if maxScan == 0 {
 		maxScan = DefaultMaxScanTuples
 	}
+	if cfg.ExactSearchRows < ExactSearchDisabled {
+		return nil, errors.New("span search exact rows cannot be negative, except ExactSearchDisabled")
+	}
 	return &Store{
 		pool:      pool,
 		schema:    cfg.Schema,
@@ -153,6 +177,7 @@ func NewStore(pool *pgxpool.Pool, cfg StoreConfig, log *slog.Logger) (*Store, er
 		spanTurns: relationIdentifier(cfg.SpanTurnsTable, DefaultSpanTurnsTable),
 		sessions:  relationIdentifier(cfg.SessionsTable, DefaultSessionsTable),
 		maxScan:   maxScan,
+		exactRows: cfg.ExactSearchRows,
 		dims:      cfg.Dimensions,
 		logger:    log,
 	}, nil
@@ -540,90 +565,54 @@ const searchOverfetch = 4
 // A span may have several chunk embeddings; results collapse to one hit per
 // span, scored by the span's best-matching chunk.
 //
-// The filters sit inside the nearest-neighbour CTE, next to the ORDER BY on
-// distance, rather than on its output. Applied afterwards they would only
-// thin an already-truncated candidate list: a filter that rejects the
-// closest rows would return fewer than topK hits, or none. Inside, with
-// pgvector's iterative index scan enabled, the HNSW scan keeps walking past
-// rejected rows until it has enough survivors or reaches hnsw.max_scan_tuples.
-// relaxed_order lets the scan emit slightly out of order; the outer ORDER BY
-// on distance restores exact order among the rows it returns.
+// A filtered search picks one of two plans by how many embedding rows its
+// filters match, counted up front by a probe capped at exactSearchRows:
 //
-// session_id comes from the joined span, not the embedding row: the
-// embedding's copy is written only on (re-)embed and goes stale when a span
-// moves session without its content changing.
+//   - Few: rank exactly. Every matching row's distance is computed and the
+//     nearest kept, so the cost is the size of the match and the answer is
+//     exact.
+//   - Many: walk the HNSW index nearest-first and test each candidate
+//     against the filters, stopping once enough pass. The cost is the
+//     number of candidates visited, about fetch × (rows / matching rows),
+//     which shrinks as the match grows.
+//
+// Neither alone serves every filter: an exact rank over a broad match reads
+// most of the table, and an index walk under a narrow one visits thousands
+// of rejected candidates before it fills topK. An unfiltered search always
+// walks the index. Choosing from the probe rather than from which filters
+// are set keeps the choice about the data, not about which filters are
+// common.
+//
+// Both plans filter on the span's turn and that turn's session. Every filter
+// is trace-level, so no plan reads the spans projection to filter: it is by
+// far the largest relation a search touches, and is probed only to confirm a
+// candidate is still a main llm span and to fetch a hit's payload. A turn's
+// session_id is its spans' session_id — tapes derives a trace's turn and
+// spans together — and session_id in the hit comes from the span, not the
+// embedding row, whose copy is written only on (re-)embed and goes stale
+// when a span moves session without its content changing.
+//
+// Both plans keep the filters in a subquery fenced with OFFSET 0 rather
+// than joining them. Joined, the planner estimates the embedding-to-span
+// join from (trace_id, span_id) as if the two keys were independent, when
+// span_id alone is the identity, and underestimates the join by roughly the
+// number of traces; believing it yields a handful of rows, it would rather
+// sort every embedding by distance than walk the index. Fenced, the filter
+// is opaque, the index walk is costed as one, and pgvector's iterative scan
+// keeps walking past rejected rows until it has enough survivors or reaches
+// hnsw.max_scan_tuples. relaxed_order lets the scan emit slightly out of
+// order; the outer ORDER BY on distance restores exact order among the rows
+// it returns.
 func (s *Store) Search(ctx context.Context, embedding []float32, topK int, filter SearchFilter) ([]Hit, error) {
-	if topK <= 0 {
-		topK = 5
-	}
-
-	args := pgx.NamedArgs{
-		"embedding": pgvectorgo.NewVector(embedding),
-		"fetch":     topK * searchOverfetch,
-		"topk":      topK,
-	}
-	where := filter.conditions(args)
-	whereClause := ""
-	if len(where) > 0 {
-		whereClause = "WHERE " + strings.Join(where, "\n\t\t\t  AND ")
-	}
-
-	live := `COALESCE(ss.ended_at IS NULL AND ss.last_seen_at > now() - interval '` + liveWindow + `', false)`
-	query := fmt.Sprintf(`
-		WITH nearest AS (
-			SELECT e.trace_id, e.span_id,
-			       e.embedding <=> @embedding AS dist
-			FROM %s e
-			JOIN %s s
-			  ON s.trace_id = e.trace_id AND s.span_id = e.span_id
-			JOIN %s t
-			  ON t.trace_id = e.trace_id
-			LEFT JOIN %s ss
-			  ON ss.id = s.session_id
-			%s
-			ORDER BY e.embedding <=> @embedding
-			LIMIT @fetch
-		),
-		best AS (
-			SELECT DISTINCT ON (trace_id, span_id) trace_id, span_id, dist
-			FROM nearest
-			ORDER BY trace_id, span_id, dist
-		)
-		SELECT b.trace_id, b.span_id, s.session_id,
-		       1 - b.dist AS score,
-		       t.user_prompt, s.model, s.started_at, s.input, s.output,
-		       COALESCE(ss.auth_subject, ''),
-		       COALESCE(ss.cwd, ''),
-		       COALESCE(ss.harness_id, ''),
-		       COALESCE(NULLIF(ss.display_name, ''), ss.derived_title, ''),
-		       ss.last_seen_at,
-		       %s
-		FROM best b
-		JOIN %s s
-		  ON s.trace_id = b.trace_id AND s.span_id = b.span_id
-		JOIN %s t
-		  ON t.trace_id = b.trace_id
-		LEFT JOIN %s ss
-		  ON ss.id = s.session_id
-		ORDER BY b.dist
-		LIMIT @topk
-	`, s.table.Sanitize(), s.spans.Sanitize(), s.spanTurns.Sanitize(), s.sessions.Sanitize(), whereClause,
-		live, s.spans.Sanitize(), s.spanTurns.Sanitize(), s.sessions.Sanitize())
-
-	// A read-only transaction scopes the scan settings to this one query:
-	// SET LOCAL (set_config(..., true)) reverts at transaction end, so a
-	// pooled connection never carries them into an unrelated statement.
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, err := s.beginSearch(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("begin span search: %w", err)
+		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx, `
-		SELECT set_config('hnsw.iterative_scan', 'relaxed_order', true),
-		       set_config('hnsw.max_scan_tuples', $1, true)
-	`, strconv.Itoa(s.maxScan)); err != nil {
-		return nil, fmt.Errorf("configuring iterative index scan: %w", err)
+	query, args, exact, err := s.prepareSearch(ctx, tx, embedding, topK, filter)
+	if err != nil {
+		return nil, err
 	}
 
 	rows, err := tx.Query(ctx, query, args)
@@ -666,12 +655,208 @@ func (s *Store) Search(ctx context.Context, embedding []float32, topK int, filte
 		return nil, fmt.Errorf("iterating span search hits: %w", err)
 	}
 
-	s.logger.Debug("span embedding search", "hits", len(hits))
+	s.logger.Debug("span embedding search", "hits", len(hits), "exact", exact)
 	return hits, nil
 }
 
-// conditions renders the filter as SQL predicates over the nearest CTE's
-// aliases (s = span, t = span turn, ss = session), binding values into args.
+// beginSearch opens the read-only transaction a search runs in. It scopes
+// the scan settings to this one search: SET LOCAL (set_config(..., true))
+// reverts at transaction end, so a pooled connection never carries them into
+// an unrelated statement.
+func (s *Store) beginSearch(ctx context.Context) (pgx.Tx, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("begin span search: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		SELECT set_config('hnsw.iterative_scan', 'relaxed_order', true),
+		       set_config('hnsw.max_scan_tuples', $1, true)
+	`, strconv.Itoa(s.maxScan)); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, fmt.Errorf("configuring iterative index scan: %w", err)
+	}
+	return tx, nil
+}
+
+// prepareSearch probes a filtered search's match inside tx and returns the
+// query Search runs, its arguments, and whether it ranks exactly.
+func (s *Store) prepareSearch(ctx context.Context, tx pgx.Tx, embedding []float32, topK int, filter SearchFilter) (string, pgx.NamedArgs, bool, error) {
+	if topK <= 0 {
+		topK = 5
+	}
+
+	fetch := topK * searchOverfetch
+	args := pgx.NamedArgs{
+		"embedding": pgvectorgo.NewVector(embedding),
+		"fetch":     fetch,
+		"topk":      topK,
+	}
+	where := filter.conditions(args)
+	filterClause := ""
+	if len(where) > 0 {
+		filterClause = "AND " + strings.Join(where, "\n\t\t\t\t  AND ")
+	}
+
+	exact := false
+	if len(where) > 0 {
+		var err error
+		if exact, err = s.matchesFew(ctx, tx, filterClause, args, fetch); err != nil {
+			if isUndefinedTable(err) {
+				return "", nil, false, ErrNotInitialized
+			}
+			return "", nil, false, err
+		}
+	}
+
+	var nearest string
+	if exact {
+		// matching keeps only traces with an embedding, as the probe counts
+		// them, so it holds no more traces than the probe allowed: turns the
+		// embed pass has not reached cannot rank, and would only inflate it.
+		nearest = fmt.Sprintf(`
+			matching AS MATERIALIZED (
+				SELECT t.trace_id
+				FROM %s t
+				LEFT JOIN %s ss
+				  ON ss.id = t.session_id
+				WHERE EXISTS (SELECT 1 FROM %s e WHERE e.trace_id = t.trace_id)
+				  %s
+			),
+			nearest AS (
+				SELECT e.trace_id, e.span_id,
+				       e.embedding <=> @embedding AS dist
+				FROM matching m
+				JOIN %s e
+				  ON e.trace_id = m.trace_id
+				WHERE EXISTS (
+					SELECT 1
+					FROM %s s
+					WHERE s.trace_id = e.trace_id AND s.span_id = e.span_id
+					OFFSET 0
+				)
+				ORDER BY dist
+				LIMIT @fetch
+			)`, s.spanTurns.Sanitize(), s.sessions.Sanitize(), s.table.Sanitize(), filterClause, s.table.Sanitize(), s.spans.Sanitize())
+	} else {
+		nearest = fmt.Sprintf(`
+			nearest AS (
+				SELECT e.trace_id, e.span_id,
+				       e.embedding <=> @embedding AS dist
+				FROM %s e
+				WHERE EXISTS (
+					SELECT 1
+					FROM %s s
+					JOIN %s t
+					  ON t.trace_id = s.trace_id
+					LEFT JOIN %s ss
+					  ON ss.id = t.session_id
+					WHERE s.trace_id = e.trace_id AND s.span_id = e.span_id
+					  %s
+					OFFSET 0
+				)
+				ORDER BY e.embedding <=> @embedding
+				LIMIT @fetch
+			)`, s.table.Sanitize(), s.spans.Sanitize(), s.spanTurns.Sanitize(), s.sessions.Sanitize(), filterClause)
+	}
+
+	live := `COALESCE(ss.ended_at IS NULL AND ss.last_seen_at > now() - interval '` + liveWindow + `', false)`
+	query := fmt.Sprintf(`
+		WITH %s,
+		best AS (
+			SELECT DISTINCT ON (trace_id, span_id) trace_id, span_id, dist
+			FROM nearest
+			ORDER BY trace_id, span_id, dist
+		)
+		SELECT b.trace_id, b.span_id, s.session_id,
+		       1 - b.dist AS score,
+		       t.user_prompt, s.model, s.started_at, s.input, s.output,
+		       COALESCE(ss.auth_subject, ''),
+		       COALESCE(ss.cwd, ''),
+		       COALESCE(ss.harness_id, ''),
+		       COALESCE(NULLIF(ss.display_name, ''), ss.derived_title, ''),
+		       ss.last_seen_at,
+		       %s
+		FROM best b
+		JOIN %s s
+		  ON s.trace_id = b.trace_id AND s.span_id = b.span_id
+		JOIN %s t
+		  ON t.trace_id = b.trace_id
+		LEFT JOIN %s ss
+		  ON ss.id = s.session_id
+		ORDER BY b.dist
+		LIMIT @topk
+	`, nearest, live, s.spans.Sanitize(), s.spanTurns.Sanitize(), s.sessions.Sanitize())
+	return query, args, exact, nil
+}
+
+// matchesFew reports whether filterClause matches few enough embedding rows
+// to rank exactly: at most exactSearchRows, counted by a probe that stops one
+// past the cap, so a broad filter costs only as many rows as the cap. The
+// probe reads turns, sessions, and the embedding table's key, never vectors
+// or the spans projection.
+func (s *Store) matchesFew(ctx context.Context, tx pgx.Tx, filterClause string, args pgx.NamedArgs, fetch int) (bool, error) {
+	limit, err := s.exactSearchRows(ctx, tx, fetch)
+	if err != nil || limit <= 0 {
+		return false, err
+	}
+	probeArgs := pgx.NamedArgs{"probe_limit": limit + 1}
+	for k, v := range args {
+		probeArgs[k] = v
+	}
+	var matched int
+	err = tx.QueryRow(ctx, fmt.Sprintf(`
+		SELECT count(*) FROM (
+			SELECT 1
+			FROM %s t
+			LEFT JOIN %s ss
+			  ON ss.id = t.session_id
+			JOIN %s e
+			  ON e.trace_id = t.trace_id
+			WHERE true
+			  %s
+			LIMIT @probe_limit
+		) probe
+	`, s.spanTurns.Sanitize(), s.sessions.Sanitize(), s.table.Sanitize(), filterClause), probeArgs).Scan(&matched)
+	if err != nil {
+		return false, fmt.Errorf("probing span search filter: %w", err)
+	}
+	return matched <= limit, nil
+}
+
+// exactSearchRows is the most matching rows a filtered search ranks exactly.
+// Ranking m rows exactly costs about m row reads; walking the index under a
+// filter matching m of n rows visits about fetch × n / m candidates, each
+// indexToExactRowCost times dearer. The two meet at
+//
+//	m = √(fetch × n × indexToExactRowCost)
+//
+// so the cap grows with the square root of the table, from the planner's
+// row estimate — a search needs the crossover's scale, not an exact count.
+// A configured ExactSearchRows overrides the estimate.
+func (s *Store) exactSearchRows(ctx context.Context, tx pgx.Tx, fetch int) (int, error) {
+	if s.exactRows != 0 {
+		return s.exactRows, nil
+	}
+	var rows float64
+	if err := tx.QueryRow(ctx,
+		`SELECT reltuples FROM pg_class WHERE oid = to_regclass($1)`,
+		s.table.Sanitize()).Scan(&rows); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("estimating span embedding rows: %w", err)
+	}
+	if rows <= 0 {
+		// Never analyzed (-1) or empty: nothing to rank exactly that the
+		// index walk would not find as cheaply.
+		return 0, nil
+	}
+	return int(math.Sqrt(float64(fetch) * rows * indexToExactRowCost)), nil
+}
+
+// conditions renders the filter as SQL predicates over a span turn (t) and
+// its session (ss), binding values into args. Every filter is trace-level,
+// so the same predicates serve the probe and both search plans.
 // Only set fields contribute, so an unfiltered search plans exactly as
 // before the filters existed.
 func (f SearchFilter) conditions(args pgx.NamedArgs) []string {

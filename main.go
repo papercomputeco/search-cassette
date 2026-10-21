@@ -98,12 +98,13 @@ func run(logger *slog.Logger) error {
 	// Schema is ensured at startup so a model/dimensions misconfiguration
 	// fails the process immediately and visibly.
 	store, err := spanembed.NewStore(pool, spanembed.StoreConfig{
-		Schema:         cfg.Schema,
-		Dimensions:     cfg.EmbeddingDimensions,
-		SpansTable:     cfg.SpansTable,
-		SpanTurnsTable: cfg.SpanTurnsTable,
-		SessionsTable:  cfg.SessionsTable,
-		MaxScanTuples:  cfg.SearchMaxScanTuples,
+		Schema:          cfg.Schema,
+		Dimensions:      cfg.EmbeddingDimensions,
+		SpansTable:      cfg.SpansTable,
+		SpanTurnsTable:  cfg.SpanTurnsTable,
+		SessionsTable:   cfg.SessionsTable,
+		MaxScanTuples:   cfg.SearchMaxScanTuples,
+		ExactSearchRows: cfg.SearchExactRows,
 	}, logger)
 	if err != nil {
 		return fmt.Errorf("could not create span embedding store: %w", err)

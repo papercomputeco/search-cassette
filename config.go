@@ -57,6 +57,11 @@ type cassetteConfig struct {
 	// the store default.
 	SearchMaxScanTuples int
 
+	// SearchExactRows caps how many matching rows a filtered search ranks
+	// exactly instead of walking the index; zero derives it from the table's
+	// size, -1 always walks the index.
+	SearchExactRows int
+
 	EmbeddingProvider   string
 	EmbeddingTarget     string
 	EmbeddingModel      string
@@ -109,6 +114,12 @@ func loadConfig() (cassetteConfig, error) {
 	}
 	if cfg.SearchMaxScanTuples < 0 {
 		return cfg, fmt.Errorf("CASSETTE_SEARCH_MAX_SCAN_TUPLES must be positive")
+	}
+	if cfg.SearchExactRows, err = envInt("CASSETTE_SEARCH_EXACT_ROWS", 0); err != nil {
+		return cfg, err
+	}
+	if cfg.SearchExactRows < -1 {
+		return cfg, fmt.Errorf("CASSETTE_SEARCH_EXACT_ROWS must be positive, or -1 to always walk the index")
 	}
 	dims, err := envInt("CASSETTE_EMBEDDING_DIMENSIONS", 0)
 	if err != nil {
