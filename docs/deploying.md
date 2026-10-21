@@ -47,6 +47,7 @@ Everything arrives through the environment. Only the database URL is required.
 | `CASSETTE_SPAN_TURNS_TABLE` | `tapes_v1.span_turns` | Span-turn projection relation. |
 | `CASSETTE_SESSIONS_TABLE` | `tapes_v1.sessions` | Session relation joined for each hit's owner, workspace, and liveness. |
 | `CASSETTE_SEARCH_MAX_SCAN_TUPLES` | `40000` | `hnsw.max_scan_tuples` for a search: how far a filtered search walks the index past rejected rows. |
+| `CASSETTE_SEARCH_EXACT_ROWS` | `0` (derived) | Most matching rows a filtered search ranks exactly instead of walking the index. `0` derives it from the embedding table's size, `-1` always walks the index. |
 | `CASSETTE_WAIT_FOR_DB` | `false` | Retry an unreachable Postgres at startup with backoff instead of exiting. |
 
 These names are mechanical: each is the manifest's config key under the standard

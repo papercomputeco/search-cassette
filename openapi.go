@@ -255,6 +255,13 @@ func manifest(name string) map[string]any {
 				"description": "hnsw.max_scan_tuples for a search: how many index tuples a filtered search may visit while skipping rows its filters reject.",
 			},
 			{
+				"key":         "search.exact_rows",
+				"type":        "int",
+				"default":     0,
+				"min":         -1,
+				"description": "Most matching rows a filtered search ranks exactly instead of walking the index. 0 derives it from the embedding table's size; -1 always walks the index.",
+			},
+			{
 				"key":         "wait_for_db",
 				"type":        "bool",
 				"default":     false,

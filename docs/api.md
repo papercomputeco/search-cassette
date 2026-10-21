@@ -34,11 +34,15 @@ A session is **live** when it has not ended and was last seen within the past fi
 minutes — the same rule tapes' session list applies. The `since`/`until` window is
 on the turn's start, again matching the session list.
 
-Filters apply inside the vector search, not to its output. With pgvector's
-iterative index scan, a filtered search keeps walking the index past rows the
-filters reject, so it still returns `top_k` hits when that many spans match — up
-to `CASSETTE_SEARCH_MAX_SCAN_TUPLES` index tuples visited, after which it returns
-what it found.
+Filters apply inside the vector search, not to its output. A filtered search
+first counts, up to a cap, how many embedded spans its filters match. When few
+do, it ranks every one of them by distance, so the result is exact. When many
+do, it walks the vector index nearest-first with pgvector's iterative scan,
+skipping rows the filters reject, so it still returns `top_k` hits when that
+many spans match — up to `CASSETTE_SEARCH_MAX_SCAN_TUPLES` index tuples
+visited, after which it returns what it found. The cap,
+`CASSETTE_SEARCH_EXACT_ROWS`, defaults to where the two strategies cost the
+same for the table's size.
 
 ```sh
 curl "localhost:8081/v1/cassettes/search/spans?query=retry+backoff&top_k=3&auth_subject=user_01&auth_subject=user_02&since=2026-06-01T00:00:00Z"
